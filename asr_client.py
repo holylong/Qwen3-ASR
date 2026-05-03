@@ -161,17 +161,23 @@ class SessionCtx:
 # Audio capture helpers
 # ──────────────────────────────────────────────
 class MicCapture:
-    def __init__(self, device=None, blocksize=CHUNK_SAMPLES):
+    def __init__(self, device=None, blocksize=CHUNK_SAMPLES, record: bool = False):
         self.q: queue.Queue = queue.Queue()
         self.stream = None
         self.device = device
         self.blocksize = blocksize
+        self.record = record
+        self._recording: list = []  # accumulated audio for saving
 
     def _cb(self, indata, frames, ti, status):
-        self.q.put(indata[:, 0].copy())
+        data = indata[:, 0].copy()
+        self.q.put(data)
+        if self.record:
+            self._recording.append(data)
 
     def start(self):
         import sounddevice as sd
+        self._recording.clear()
         self.stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype=np.float32,
             callback=self._cb, blocksize=self.blocksize, device=self.device,
@@ -189,6 +195,14 @@ class MicCapture:
             return self.q.get_nowait()
         except queue.Empty:
             return None
+
+    def save_wav(self, filepath: str):
+        if not self.record or not self._recording:
+            return
+        import soundfile as sf
+        audio = np.concatenate(self._recording)
+        sf.write(filepath, audio, SAMPLE_RATE)
+        return filepath
 
 
 # ──────────────────────────────────────────────
@@ -372,7 +386,7 @@ async def run_client(args):
         except ValueError:
             device = args.device
 
-    mic = MicCapture(device=device)
+    mic = MicCapture(device=device, record=args.save_audio)
     ctx = SessionCtx()
     result_q: asyncio.Queue = asyncio.Queue()
     stop_flag = threading.Event()
@@ -417,7 +431,17 @@ async def run_client(args):
         tui.err(f"{type(e).__name__}: {e}")
     finally:
         mic.stop()
-        tui._c()
+        if args.save_audio:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = mic.save_wav(args.save_audio if args.save_audio != "1"
+                                else f"recording_{ts}.wav")
+            if path:
+                tui._c()
+                print(f"Audio saved: {path}")
+            else:
+                tui._c()
+        else:
+            tui._c()
 
 
 def parse_args():
@@ -436,6 +460,8 @@ def parse_args():
     p.add_argument("--list-devices", action="store_true")
     p.add_argument("--vad-threshold", type=float, default=VAD_THRESHOLD)
     p.add_argument("--pre-roll-sec", type=float, default=PRE_ROLL_SEC)
+    p.add_argument("--save-audio", nargs="?", const="1", default=None,
+                   help="Save captured audio to WAV file (optional: path)")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
 
