@@ -142,12 +142,17 @@ async def _send_error(ws: WebSocket, message: str) -> None:
 # ---------------------------------------------------------------------------
 def _streaming_step(pcm: np.ndarray, state) -> None:
     """Blocking call to streaming_transcribe (runs in thread pool)."""
+    logger.debug(f"  streaming_transcribe: pcm_len={pcm.shape[0]}, buffer={state.buffer.shape[0]}, "
+                 f"chunk_id={state.chunk_id}")
     asr_model.streaming_transcribe(pcm, state)
+    logger.debug(f"  streaming_transcribe done: language={state.language!r}, text={state.text[:80]!r}")
 
 
 def _finish_streaming(state):
     """Blocking finalize call (runs in thread pool)."""
+    logger.debug(f"  finish_streaming: accum_audio_len={state.audio_accum.shape[0]}")
     asr_model.finish_streaming_transcribe(state)
+    logger.debug(f"  finish_streaming done: language={state.language!r}, text={state.text[:80]!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +197,8 @@ async def websocket_asr(ws: WebSocket):
                 pcm = np.frombuffer(data, dtype=np.float32).reshape(-1)
                 if pcm.size == 0:
                     continue
+
+                logger.debug(f"WS audio chunk: len={pcm.size} samples, session={session_id[:8]}")
 
                 if s.mode == "two-pass":
                     s.audio_accum = np.concatenate([s.audio_accum, pcm], axis=0)
@@ -344,11 +351,16 @@ def parse_args():
     p.add_argument("--unfixed-token-num", type=int, default=5)
     p.add_argument("--chunk-size-sec", type=float, default=1.0,
                    help="Chunk size in seconds")
+    p.add_argument("--debug", action="store_true",
+                   help="Enable debug-level logging")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     global asr_model, UNFIXED_CHUNK_NUM, UNFIXED_TOKEN_NUM, CHUNK_SIZE_SEC
     UNFIXED_CHUNK_NUM = args.unfixed_chunk_num

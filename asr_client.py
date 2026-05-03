@@ -6,13 +6,14 @@ Connects to the Qwen3-ASR WebSocket server and performs streaming speech
 recognition. Supports single-pass (streaming) and two-pass (streaming +
 offline refinement) modes.
 
-Each speech segment (detected by energy-based VAD) starts a new ASR session.
-Results are displayed in real-time in the terminal.
+Audio is captured at 16kHz mono and processed through energy-based VAD.
+Speech segments are streamed to the server in real-time.
 
 Usage:
     python asr_client.py --url ws://localhost:8000/ws/asr
     python asr_client.py --url ws://localhost:8000/ws/asr --two-pass
-    python asr_client.py --url ws://localhost:8000/ws/asr --list-devices
+    python asr_client.py --url ws://localhost:8000/ws/asr --verbose
+    python asr_client.py --list-devices
 
 Install:
     pip install sounddevice websockets numpy
@@ -26,17 +27,19 @@ import queue
 import signal
 import sys
 import threading
+import time
 from typing import Optional
 
 import numpy as np
 
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 0.5
+CHUNK_DURATION = 0.25           # 250ms blocks (send frequently for low latency)
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION)
 
-VAD_THRESHOLD = 0.02
-SILENCE_DURATION_SEC = 0.8
-MIN_SPEECH_FRAMES = 4
+# VAD — tuned for typical desktop/headset microphones
+VAD_THRESHOLD = 0.015            # RMS energy threshold (lower = more sensitive)
+SILENCE_DURATION_SEC = 1.0       # silence before auto-finish
+MIN_SPEECH_FRAMES = 3            # min consecutive speech frames before streaming
 
 STATE_IDLE = "idle"
 STATE_SPEAKING = "speaking"
@@ -46,9 +49,11 @@ class VADState:
     """Energy-based Voice Activity Detection."""
 
     def __init__(self, threshold: float = VAD_THRESHOLD,
-                 silence_sec: float = SILENCE_DURATION_SEC):
+                 silence_sec: float = SILENCE_DURATION_SEC,
+                 min_speech_frames: int = MIN_SPEECH_FRAMES):
         self.threshold = threshold
-        self.silence_frames = int(silence_sec / CHUNK_DURATION)
+        self.silence_frames = max(1, int(silence_sec / CHUNK_DURATION))
+        self.min_speech_frames = max(1, min_speech_frames)
         self.speech_frames = 0
         self.silent_frames = 0
         self.state = STATE_IDLE
@@ -56,23 +61,22 @@ class VADState:
     def is_speech(self, chunk: np.ndarray) -> bool:
         if chunk.size == 0:
             return False
-        rms = np.sqrt(np.mean(chunk.astype(np.float64) ** 2))
+        rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
         return rms > self.threshold
 
-    def update(self, chunk: np.ndarray) -> str:
-        speech = self.is_speech(chunk)
+    def update(self, is_speech_frame: bool) -> str:
         if self.state == STATE_IDLE:
-            if speech:
+            if is_speech_frame:
                 self.speech_frames += 1
-                if self.speech_frames >= MIN_SPEECH_FRAMES:
+                if self.speech_frames >= self.min_speech_frames:
                     self.state = STATE_SPEAKING
                     self.silent_frames = 0
                     return STATE_SPEAKING
             else:
-                self.speech_frames = 0
+                self.speech_frames = max(0, self.speech_frames - 1)
             return STATE_IDLE
-        else:  # STATE_SPEAKING
-            if speech:
+        else:
+            if is_speech_frame:
                 self.silent_frames = 0
             else:
                 self.silent_frames += 1
@@ -83,7 +87,7 @@ class VADState:
             return STATE_SPEAKING
 
 
-def _terminal_width() -> int:
+def _term_width() -> int:
     try:
         return os.get_terminal_size().columns
     except Exception:
@@ -92,16 +96,26 @@ def _terminal_width() -> int:
 
 def _trim(text: str, width: int = 0) -> str:
     if width <= 0:
-        width = _terminal_width()
-    avail = max(20, width - 8)
+        width = _term_width()
+    avail = max(20, width - 10)
     return text if len(text) <= avail else text[:avail] + "..."
 
 
 class TerminalUI:
-    """Minimal terminal display."""
+    """Minimal terminal display with optional verbose mode."""
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
 
     def _clear(self):
         sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+    def echo(self, *args):
+        if not self.verbose:
+            return
+        self._clear()
+        sys.stdout.write("\r  \033[90m" + " ".join(str(a) for a in args) + "\033[0m\n")
         sys.stdout.flush()
 
     def partial(self, text: str, language: str = ""):
@@ -138,7 +152,8 @@ async def list_audio_devices():
     for i, dev in enumerate(sd.query_devices()):
         if dev.get("max_input_channels", 0) > 0:
             sr = dev.get("default_samplerate", 0)
-            print(f"  [{i}] {dev['name']}  (in: {dev['max_input_channels']}ch, "
+            print(f"  [{i}] {dev['name']}  "
+                  f"(in: {dev['max_input_channels']}ch, "
                   f"SR: {int(sr) if sr else '?'}Hz)")
     print()
 
@@ -147,14 +162,14 @@ async def run_client(args: argparse.Namespace):
     import sounddevice as sd
     import websockets
 
-    ui = TerminalUI()
+    ui = TerminalUI(verbose=args.verbose)
     audio_queue: queue.Queue = queue.Queue()
     stop_flag = threading.Event()
     stream = None
 
     def cb(indata, frames, time_info, status):
         if status:
-            print(f"\nAudio: {status}", file=sys.stderr)
+            ui.echo(f"Audio status: {status}")
         audio_queue.put(indata[:, 0].copy())
 
     device = None
@@ -187,52 +202,61 @@ async def run_client(args: argparse.Namespace):
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    async def drain_audio():
-        """Drain audio_queue into a numpy chunk, or return None if empty."""
-        parts = []
+    # Pending audio chunks from sounddevice callback (not yet VAD-processed).
+    pending_chunks: list = []
+
+    def drain_one_chunk() -> Optional[np.ndarray]:
+        """Return a single 250ms chunk if available; None otherwise."""
+        nonlocal pending_chunks
         try:
             while True:
-                parts.append(audio_queue.get_nowait())
+                pending_chunks.append(audio_queue.get_nowait())
         except queue.Empty:
             pass
-        if not parts:
-            return None
-        return np.concatenate(parts)
+        if pending_chunks:
+            return pending_chunks.pop(0)
+        return None
 
-    async def read_server_results(ws, wait: float = 0.05):
-        """Read any pending result messages from server."""
+    async def read_pending_results(ws, wait: float = 0.03) -> bool:
+        """Read any pending messages from server."""
+        got_any = False
         while True:
             try:
                 msg_text = await asyncio.wait_for(ws.recv(), timeout=wait)
             except asyncio.TimeoutError:
-                return
+                break
             except websockets.exceptions.ConnectionClosed:
-                return
+                break
             try:
                 msg = json.loads(msg_text)
             except json.JSONDecodeError:
                 continue
             if msg.get("type") == "result":
                 is_partial = msg.get("is_partial", False)
+                p = msg.get("pass", 1)
+                lang = msg.get("language", "")
+                txt = msg.get("text", "")
                 if is_partial:
-                    ui.partial(msg.get("text", ""), msg.get("language", ""))
+                    ui.partial(txt, lang)
                 else:
-                    ui.final(msg.get("text", ""), msg.get("language", ""),
-                             msg.get("pass", 1))
+                    ui.final(txt, lang, p)
+                got_any = True
             elif msg.get("type") == "error":
                 ui.error(msg.get("message", "Server error"))
+                got_any = True
+            elif args.verbose:
+                ui.echo("  server:", msg.get("type", "?"))
+        return got_any
 
-    async def finish_session(ws, ui):
-        """Send finish, then wait for final results (pass 1 + optional pass 2)."""
+    async def finish_session(ws) -> None:
+        """Send finish, wait for final results."""
         await ws.send(json.dumps({"type": "finish"}))
-        seen_p1 = False
-        start = asyncio.get_event_loop().time()
-        while True:
-            timeout = max(0.1, 5.0 - (asyncio.get_event_loop().time() - start))
-            if timeout <= 0:
-                break
+        deadline = asyncio.get_event_loop().time() + 8.0
+        got_p1 = False
+        while asyncio.get_event_loop().time() < deadline:
             try:
-                msg_text = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                remaining = max(0.1, deadline - asyncio.get_event_loop().time())
+                msg_text = await asyncio.wait_for(ws.recv(), timeout=min(2.0, remaining))
             except asyncio.TimeoutError:
                 break
             except websockets.exceptions.ConnectionClosed:
@@ -241,20 +265,18 @@ async def run_client(args: argparse.Namespace):
                 msg = json.loads(msg_text)
             except json.JSONDecodeError:
                 continue
-            if msg.get("type") == "result" and not msg.get("is_partial"):
-                ui.final(msg.get("text", ""), msg.get("language", ""),
-                         msg.get("pass", 1))
-                pass_num = msg.get("pass", 1)
-                if pass_num == 1:
-                    seen_p1 = True
-                if pass_num >= 2:
+            if msg.get("type") == "result" and not msg.get("is_partial", True):
+                p = msg.get("pass", 1)
+                ui.final(msg.get("text", ""), msg.get("language", ""), p)
+                if p == 1:
+                    got_p1 = True
+                if p >= 2:
                     break
             elif msg.get("type") == "error":
                 ui.error(msg.get("message", "Server error"))
                 break
-        return seen_p1
 
-    # ---- main connection loop ----
+    # ──── main loop ────
     ui.status("Connecting...")
     try:
         async with websockets.connect(
@@ -273,16 +295,28 @@ async def run_client(args: argparse.Namespace):
             ui.status("Connected. Speak now... (Ctrl+C to stop)")
 
             while running and not stop_flag.is_set():
-                chunk = await drain_audio()
-                await read_server_results(ws, wait=0.02)
+                chunk = drain_one_chunk()
+
+                # Always drain server results
+                await read_pending_results(ws, wait=0.01)
 
                 if chunk is None:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.02)
                     continue
 
-                new_state = vad.update(chunk)
+                # Compute speech flag
+                if chunk.size > 0:
+                    rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+                    is_speech_frame = rms > args.vad_threshold
+                    if args.verbose:
+                        ui.echo(f"VAD: rms={rms:.4f} thr={args.vad_threshold} speech={is_speech_frame} "
+                                f"state={vad.state} sf={vad.speech_frames}/{vad.min_speech_frames}")
+                else:
+                    is_speech_frame = False
 
-                # --- IDLE -> SPEAKING: start a new session ---
+                new_state = vad.update(is_speech_frame)
+
+                # ---- IDLE → SPEAKING ----
                 if prev_state == STATE_IDLE and new_state == STATE_SPEAKING:
                     ui.status("Speech detected — starting session...")
                     await ws.send(json.dumps({"type": "start", "mode": mode}))
@@ -295,27 +329,32 @@ async def run_client(args: argparse.Namespace):
                     have_session = True
                     sid = r.get("session_id", "?")[:8]
                     ui.status(f"[{sid}] Processing...")
+                    # drain any pending results from server
+                    await read_pending_results(ws, wait=0.05)
 
-                # --- SPEAKING: send audio chunk ---
+                # ---- SPEAKING: send chunk ----
                 if new_state == STATE_SPEAKING and have_session:
                     await ws.send(chunk.tobytes())
-                    await read_server_results(ws, wait=0.05)
+                    await read_pending_results(ws, wait=0.05)
 
-                # --- SPEAKING -> IDLE: finish session ---
+                # ---- SPEAKING → IDLE ----
                 if prev_state == STATE_SPEAKING and new_state == STATE_IDLE:
                     if have_session:
                         ui.status("Speech ended — finishing...")
-                        await finish_session(ws, ui)
+                        await finish_session(ws)
                         have_session = False
+                        # drain remaining
+                        await read_pending_results(ws, wait=0.1)
                     ui.status("Listening...")
 
                 prev_state = new_state
 
+            # Shutdown
             if have_session:
                 ui.status("Stopping — finishing last session...")
                 try:
                     await ws.send(json.dumps({"type": "finish"}))
-                    await asyncio.wait_for(read_server_results(ws, wait=0.3), timeout=3.0)
+                    await asyncio.wait_for(read_pending_results(ws, wait=0.3), timeout=4.0)
                 except Exception:
                     pass
 
@@ -346,15 +385,19 @@ def parse_args():
 Examples:
   python asr_client.py --url ws://localhost:8000/ws/asr
   python asr_client.py --url ws://localhost:8000/ws/asr --two-pass
-  python asr_client.py --url ws://localhost:8000/ws/asr --device 1
+  python asr_client.py --url ws://localhost:8000/ws/asr --verbose
+  python asr_client.py --url ws://localhost:8000/ws/asr --vad-threshold 0.01
   python asr_client.py --list-devices
         """,
     )
     p.add_argument("--url", default="ws://localhost:8000/ws/asr", help="WebSocket server URL")
-    p.add_argument("--two-pass", action="store_true", help="Enable 2-pass mode (streaming + offline refine)")
+    p.add_argument("--two-pass", action="store_true", help="Enable 2-pass mode")
     p.add_argument("--device", default=None, help="Audio input device index or name")
-    p.add_argument("--list-devices", action="store_true", help="List audio input devices and exit")
-    p.add_argument("--vad-threshold", type=float, default=VAD_THRESHOLD, help="VAD RMS energy threshold (default: 0.02)")
+    p.add_argument("--list-devices", action="store_true", help="List devices and exit")
+    p.add_argument("--vad-threshold", type=float, default=VAD_THRESHOLD,
+                   help=f"VAD RMS threshold (default: {VAD_THRESHOLD})")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Print VAD RMS values and debug info")
     return p.parse_args()
 
 
