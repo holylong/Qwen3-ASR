@@ -19,16 +19,29 @@ Protocol (WebSocket):
         {"type": "error", "message": "..."}
 
 Usage:
+    # From HuggingFace Hub
     python asr_server.py --asr-model-path Qwen/Qwen3-ASR-1.7B --port 8000
 
+    # From ModelScope (auto-download)
+    python asr_server.py --asr-model-path Qwen/Qwen3-ASR-1.7B --use-modelscope --port 8000
+
+    # From ModelScope with custom cache dir
+    python asr_server.py --asr-model-path Qwen/Qwen3-ASR-1.7B --use-modelscope \\
+        --modelscope-cache-dir ./models --port 8000
+
 Install:
-    pip install qwen-asr[vllm] fastapi uvicorn websockets
+    # HuggingFace backend
+    pip install qwen-asr[vllm] fastapi uvicorn
+
+    # ModelScope support (additional)
+    pip install modelscope
 """
 
 import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -285,18 +298,52 @@ async def websocket_asr(ws: WebSocket):
 
 
 # ---------------------------------------------------------------------------
+# Model download (ModelScope)
+# ---------------------------------------------------------------------------
+def _download_from_modelscope(model_id: str, cache_dir: str) -> str:
+    logger.info(f"Downloading model from ModelScope: {model_id}")
+    try:
+        from modelscope import snapshot_download
+    except ImportError:
+        raise ImportError(
+            "modelscope is not installed. Install with: pip install modelscope"
+        )
+    local_dir = snapshot_download(model_id, cache_dir=cache_dir)
+    logger.info(f"Model downloaded to: {local_dir}")
+    return local_dir
+
+
+def _resolve_model_path(model_path: str, use_modelscope: bool,
+                        modelscope_cache_dir: str) -> str:
+    if not use_modelscope:
+        return model_path
+    if os.path.isdir(model_path):
+        logger.info(f"Using local model directory: {model_path}")
+        return model_path
+    return _download_from_modelscope(model_path, modelscope_cache_dir)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Qwen3-ASR WebSocket Server")
-    p.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-1.7B", help="Model name or local path")
+    p.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-1.7B",
+                   help="Model name or local path (ModelScope or HuggingFace)")
+    p.add_argument("--use-modelscope", action="store_true",
+                   help="Download model from ModelScope instead of HuggingFace Hub")
+    p.add_argument("--modelscope-cache-dir", default=None,
+                   help="ModelScope download cache directory (default: ~/.cache/modelscope)")
     p.add_argument("--host", default="0.0.0.0", help="Bind host")
     p.add_argument("--port", type=int, default=8000, help="Bind port")
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.8, help="vLLM GPU memory utilization")
-    p.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens for generation")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.8,
+                   help="vLLM GPU memory utilization")
+    p.add_argument("--max-new-tokens", type=int, default=256,
+                   help="Max new tokens for generation")
     p.add_argument("--unfixed-chunk-num", type=int, default=2)
     p.add_argument("--unfixed-token-num", type=int, default=5)
-    p.add_argument("--chunk-size-sec", type=float, default=1.0, help="Chunk size in seconds")
+    p.add_argument("--chunk-size-sec", type=float, default=1.0,
+                   help="Chunk size in seconds")
     return p.parse_args()
 
 
@@ -308,11 +355,17 @@ def main():
     UNFIXED_TOKEN_NUM = args.unfixed_token_num
     CHUNK_SIZE_SEC = args.chunk_size_sec
 
+    model_path = _resolve_model_path(
+        args.asr_model_path,
+        use_modelscope=args.use_modelscope,
+        modelscope_cache_dir=args.modelscope_cache_dir,
+    )
+
     from qwen_asr import Qwen3ASRModel
 
-    logger.info(f"Loading model: {args.asr_model_path}")
+    logger.info(f"Loading model from: {model_path}")
     asr_model = Qwen3ASRModel.LLM(
-        model=args.asr_model_path,
+        model=model_path,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_new_tokens=args.max_new_tokens,
     )
