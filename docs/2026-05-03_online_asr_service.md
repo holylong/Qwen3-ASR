@@ -214,6 +214,51 @@ VAD: rms=0.0192 thr=0.015 speech=True state=speaking sf=3/3
 
 `--pre-roll-sec` 控制缓冲区长度（默认 1.5s），该值应 ≥ VAD 预热时间。
 
+### 问题：GPU 显存无论大小模型都占满
+
+**根因：vLLM 的 `gpu_memory_utilization` 控制 KV Cache 预占比，非模型占用。**
+
+vLLM 内部计算：
+```
+KV_cache_size = total_vram × gpu_memory_utilization − model_size
+```
+
+- 24GB 显卡 @ 0.8: `24×0.8 − 3.4 = 15.8 GB` KV cache
+- 24GB 显卡 @ 0.5: `24×0.5 − 3.4 = 8.6 GB` KV cache
+
+0.6B 模型（~1.2GB）和 1.7B 模型（~3.4GB）差 2.2GB，但 KV cache 都是按比例算的，所以显存占用看起来差不多。
+
+**修复：** 默认值从 0.8 降为 0.5，显卡越小越应该调低。
+```bash
+python asr_server.py --gpu-memory-utilization 0.3 ...  # 8GB 显卡
+```
+
+### 问题：无法做到实时识别
+
+**根因：Qwen3-ASR 架构设计 — 每个 chunk 重新编码全部累积音频。**
+
+关键代码 `qwen_asr/inference/qwen3_asr.py:725-751`：
+```python
+state.audio_accum = np.concatenate([state.audio_accum, chunk])  # 无限增长
+inp = {"audio": [state.audio_accum]}  # 每次编码全部音频
+```
+
+| 说话时长 | 编码量 | 每 chunk 耗时 |
+|----------|--------|--------------|
+| 5s | 1s+2s+3s+4s+5s = 15s 量 | ~200ms |
+| 15s | 累积 ~120s 量 | ~500ms |
+| 30s | 累积 ~465s 量 | ~1s+ → **掉队** |
+
+这是模型的设计取舍（完整上下文 → 最高精度）。Qwen3-ASR 流式提供的是"增量结果"而非"实时编码"。
+
+**缓解措施：**
+1. **客户端 VAD 自然分段**：每段语音自动重启 session，编码量重置
+2. **并发 send/receive**：客户端现在分离为两个 asyncio task，音频持续发送不阻塞
+3. **降低 `gpu_memory_utilization`**：避免显存争抢导致 swap
+4. **2-pass 模式**：pass 1 流式快览 + pass 2 离线完整一次（不再每 chunk 重复编码）
+
+**如果你需要真正"逐帧实时"（如直播字幕），建议考虑纯 CTC 模型（如 Whisper、Zipformer），而非 encoder-decoder 架构。**
+
 ## 已知限制
 
 1. 流式推理仅支持 vLLM backend（transformers backend 不支持）

@@ -343,8 +343,8 @@ def parse_args():
                    help="ModelScope download cache directory (default: ~/.cache/modelscope)")
     p.add_argument("--host", default="0.0.0.0", help="Bind host")
     p.add_argument("--port", type=int, default=8000, help="Bind port")
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.8,
-                   help="vLLM GPU memory utilization")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.5,
+                   help="vLLM GPU memory utilization (lower = less KV cache, more free VRAM)")
     p.add_argument("--max-new-tokens", type=int, default=256,
                    help="Max new tokens for generation")
     p.add_argument("--unfixed-chunk-num", type=int, default=2)
