@@ -196,6 +196,24 @@ VAD: rms=0.0192 thr=0.015 speech=True state=speaking sf=3/3
 
 如果 RMS 值始终低于 threshold，调低 `--vad-threshold`（尝试 0.005 或 0.01）。
 
+### 问题：丢前两个字/单词
+
+**根本原因：VAD 预热延迟导致前端削波（front-end clipping）**
+
+- VAD 需要 3 帧连续语音（0.75s）才触发 SPEAKING 状态
+- 这 0.75s 内的语音帧只进了 pre_roll 缓冲区，未发送给服务端
+- 修复：增加 **pre-roll buffer**（预滚动缓冲），VAD 触发时将缓冲区的预热帧一次性发送
+
+工作原理：
+```
+帧0(sil) 帧1(sil) 帧2(sp1) 帧3(sp2) 帧4(sp3)←VAD触发  帧5(sp4)
+  │        │         │        │         │              │
+  └──pre-roll 缓冲: [sil,sil,sp1,sp2]────┘flush        │
+                                       发送 sp3 ──────→│ 发送 sp4
+```
+
+`--pre-roll-sec` 控制缓冲区长度（默认 1.5s），该值应 ≥ VAD 预热时间。
+
 ## 已知限制
 
 1. 流式推理仅支持 vLLM backend（transformers backend 不支持）

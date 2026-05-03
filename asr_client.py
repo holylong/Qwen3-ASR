@@ -28,18 +28,20 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 import numpy as np
 
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 0.25           # 250ms blocks (send frequently for low latency)
+CHUNK_DURATION = 0.25
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION)
 
-# VAD — tuned for typical desktop/headset microphones
-VAD_THRESHOLD = 0.015            # RMS energy threshold (lower = more sensitive)
-SILENCE_DURATION_SEC = 1.0       # silence before auto-finish
-MIN_SPEECH_FRAMES = 3            # min consecutive speech frames before streaming
+# VAD
+VAD_THRESHOLD = 0.015
+SILENCE_DURATION_SEC = 1.0
+MIN_SPEECH_FRAMES = 3            # warm-up before streaming triggers
+PRE_ROLL_SEC = 1.5               # pre-roll buffer (must be >= warm-up time)
 
 STATE_IDLE = "idle"
 STATE_SPEAKING = "speaking"
@@ -290,6 +292,8 @@ async def run_client(args: argparse.Namespace):
             vad = VADState(threshold=args.vad_threshold)
             prev_state = STATE_IDLE
             have_session = False
+            pre_roll_max = max(1, int(args.pre_roll_sec / CHUNK_DURATION))
+            pre_roll_buf: deque = deque(maxlen=pre_roll_max)
 
             start_mic()
             ui.status("Connected. Speak now... (Ctrl+C to stop)")
@@ -316,7 +320,7 @@ async def run_client(args: argparse.Namespace):
 
                 new_state = vad.update(is_speech_frame)
 
-                # ---- IDLE → SPEAKING ----
+                # ---- IDLE → SPEAKING: flush pre-roll, then start session ----
                 if prev_state == STATE_IDLE and new_state == STATE_SPEAKING:
                     ui.status("Speech detected — starting session...")
                     await ws.send(json.dumps({"type": "start", "mode": mode}))
@@ -329,7 +333,15 @@ async def run_client(args: argparse.Namespace):
                     have_session = True
                     sid = r.get("session_id", "?")[:8]
                     ui.status(f"[{sid}] Processing...")
-                    # drain any pending results from server
+
+                    # Flush pre-roll buffer so first words aren't lost
+                    if pre_roll_buf:
+                        for buf_chunk in list(pre_roll_buf):
+                            await ws.send(buf_chunk.tobytes())
+                        if args.verbose:
+                            ui.echo(f"  pre-roll: sent {len(pre_roll_buf)} chunks "
+                                    f"({len(pre_roll_buf) * CHUNK_DURATION:.1f}s)")
+                        pre_roll_buf.clear()
                     await read_pending_results(ws, wait=0.05)
 
                 # ---- SPEAKING: send chunk ----
@@ -346,6 +358,9 @@ async def run_client(args: argparse.Namespace):
                         # drain remaining
                         await read_pending_results(ws, wait=0.1)
                     ui.status("Listening...")
+
+                # Append to pre-roll AFTER sending (avoids double-send on transition)
+                pre_roll_buf.append(chunk.copy())
 
                 prev_state = new_state
 
@@ -396,6 +411,8 @@ Examples:
     p.add_argument("--list-devices", action="store_true", help="List devices and exit")
     p.add_argument("--vad-threshold", type=float, default=VAD_THRESHOLD,
                    help=f"VAD RMS threshold (default: {VAD_THRESHOLD})")
+    p.add_argument("--pre-roll-sec", type=float, default=PRE_ROLL_SEC,
+                   help=f"Pre-roll buffer seconds (default: {PRE_ROLL_SEC})")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print VAD RMS values and debug info")
     return p.parse_args()
