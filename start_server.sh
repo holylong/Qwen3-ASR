@@ -11,11 +11,13 @@
 
 set -euo pipefail
 
-MODEL="${MODEL:-Qwen/Qwen3-ASR-1.7B}"
+#MODEL="${MODEL:-Qwen/Qwen3-ASR-1.7B}"
+MODEL="models/Qwen3-ASR-1.7B"
 PORT="${PORT:-8000}"
 HOST="${HOST:-0.0.0.0}"
 GPU_MEM="${GPU_MEM:-0.5}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 CHUNK_SIZE="${CHUNK_SIZE:-1.0}"
 UNFIXED_CHUNK="${UNFIXED_CHUNK:-2}"
 UNFIXED_TOKEN="${UNFIXED_TOKEN:-5}"
@@ -44,6 +46,7 @@ echo "Model      : $MODEL"
 echo "Port       : $PORT"
 echo "GPU memory : $GPU_MEM"
 echo "Max tokens : $MAX_TOKENS"
+echo "Max seq len: $MAX_MODEL_LEN"
 echo "Chunk size : ${CHUNK_SIZE}s"
 echo ""
 
@@ -52,6 +55,7 @@ python asr_server.py \
     --host "$HOST" \
     --port "$PORT" \
     --gpu-memory-utilization "$GPU_MEM" \
+    --max-model-len "$MAX_MODEL_LEN" \
     --max-new-tokens "$MAX_TOKENS" \
     --unfixed-chunk-num "$UNFIXED_CHUNK" \
     --unfixed-token-num "$UNFIXED_TOKEN" \

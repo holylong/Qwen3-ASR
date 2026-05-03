@@ -123,11 +123,12 @@ class TUI:
         sys.stdout.write(f"\r  \033[33m●\033[0m {l}{_trim(text)}")
         sys.stdout.flush()
 
-    def final(self, text, lang="", p=1):
+    def final(self, text, lang="", p=1, elapsed=0.0):
         self._c()
         pl = f"(P{p}) " if p >= 2 else ""
         l = f"[{lang}] " if lang else ""
-        sys.stdout.write(f"\r  \033[32m✔\033[0m {pl}{l}{text}\n")
+        t = f"  \033[90m{elapsed:.1f}s\033[0m" if elapsed > 0 else ""
+        sys.stdout.write(f"\r  \033[32m✔\033[0m {pl}{l}{text}{t}\n")
         sys.stdout.flush()
 
     def err(self, m):
@@ -214,13 +215,9 @@ async def recv_loop(ws, result_q: asyncio.Queue, ctx: SessionCtx, tui: TUI, stop
             ctx.start_ok.set()
         elif t == "result":
             is_partial = msg.get("is_partial", False)
-            lang = msg.get("language", "")
-            txt = msg.get("text", "")
-            p = msg.get("pass", 1)
             if is_partial:
-                tui.partial(txt, lang)
-            else:
-                tui.final(txt, lang, p)
+                tui.partial(msg.get("text", ""), msg.get("language", ""))
+            # final results are displayed by send_loop with timing
         elif t == "error":
             tui.err(msg.get("message", "Server error"))
         elif tui.verbose:
@@ -240,7 +237,8 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
     pre_roll: deque = deque(maxlen=pre_roll_max)
 
     flush_deadline = 0.0
-    final_results_pending = 0  # how many pass-2 results we expect
+    final_results_pending = 0
+    utt_start_time = 0.0
 
     while not stop.is_set():
         chunk = mic.drain_one()
@@ -270,6 +268,7 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
 
         # ── IDLE → SPEAKING ──
         if prev_state == STATE_IDLE and new_state == STATE_SPEAKING:
+            utt_start_time = asyncio.get_event_loop().time()
             ctx.start_ok.clear()
             ctx.active = False
             mode = "two-pass" if args.two_pass else "streaming"
@@ -302,8 +301,8 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
             if ctx.active:
                 tui.status("Speech ended — finishing...")
                 await ws.send(json.dumps({"type": "finish"}))
-                # Wait for final results (pass 1 + optional pass 2)
-                await _wait_final_results(result_q, tui, timeout=8.0)
+                await _wait_final_results(result_q, tui, timeout=8.0,
+                                          utt_start=utt_start_time)
                 ctx.active = False
             tui.status("Listening...")
 
@@ -316,13 +315,16 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
         tui.status("Stopping — finishing...")
         try:
             await ws.send(json.dumps({"type": "finish"}))
-            await _wait_final_results(result_q, tui, timeout=4.0)
+            await _wait_final_results(result_q, tui, timeout=4.0,
+                                      utt_start=utt_start_time)
         except Exception:
             pass
 
 
-async def _wait_final_results(result_q: asyncio.Queue, tui: TUI, timeout: float):
+async def _wait_final_results(result_q: asyncio.Queue, tui: TUI, timeout: float,
+                              utt_start: float = 0.0):
     deadline = asyncio.get_event_loop().time() + timeout
+    got_any = False
     while asyncio.get_event_loop().time() < deadline:
         try:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -332,7 +334,14 @@ async def _wait_final_results(result_q: asyncio.Queue, tui: TUI, timeout: float)
         except asyncio.TimeoutError:
             break
         if msg.get("type") == "result" and not msg.get("is_partial", True):
-            tui.final(msg.get("text", ""), msg.get("language", ""), msg.get("pass", 1))
+            elapsed = 0.0
+            if utt_start > 0 and not got_any:
+                elapsed = asyncio.get_event_loop().time() - utt_start
+                got_any = True
+            elif utt_start > 0:
+                elapsed = asyncio.get_event_loop().time() - utt_start
+            tui.final(msg.get("text", ""), msg.get("language", ""),
+                      msg.get("pass", 1), elapsed)
             if msg.get("pass", 1) >= 2:
                 break
         elif msg.get("type") == "error":

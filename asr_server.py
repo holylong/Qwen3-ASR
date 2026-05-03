@@ -345,6 +345,9 @@ def parse_args():
     p.add_argument("--port", type=int, default=8000, help="Bind port")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.5,
                    help="vLLM GPU memory utilization (lower = less KV cache, more free VRAM)")
+    p.add_argument("--max-model-len", type=int, default=16384,
+                   help="Max sequence length for vLLM (lower = less KV cache VRAM; "
+                        "65536=LLM default, 16384=enough for ~10min ASR)")
     p.add_argument("--max-new-tokens", type=int, default=256,
                    help="Max new tokens for generation")
     p.add_argument("--unfixed-chunk-num", type=int, default=2)
@@ -376,10 +379,12 @@ def main():
     from qwen_asr import Qwen3ASRModel
 
     logger.info(f"Loading model from: {model_path}")
+    logger.info(f"  gpu_memory_utilization={args.gpu_memory_utilization}, max_model_len={args.max_model_len}")
     asr_model = Qwen3ASRModel.LLM(
         model=model_path,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_new_tokens=args.max_new_tokens,
+        max_model_len=args.max_model_len,
     )
     logger.info("Model loaded.")
 

@@ -259,6 +259,18 @@ inp = {"audio": [state.audio_accum]}  # 每次编码全部音频
 
 **如果你需要真正"逐帧实时"（如直播字幕），建议考虑纯 CTC 模型（如 Whisper、Zipformer），而非 encoder-decoder 架构。**
 
+### 问题：客户端输出重复 + 识别耗时
+
+**双份输出根因：** `recv_loop` 和 `_wait_final_results` 都显示最终结果。
+- `recv_loop`（后台持续接收）收到 final → 显示一次
+- `send_loop` 调用 `_wait_final_results` 从队列读同一条 → 再显示一次
+- 修复：`recv_loop` 仅显示 partial 结果，final 统一由 `_wait_final_results` 显示
+
+**耗时统计：** 每条结果后追加识别耗时：
+```
+  ✔ [English] hello world  2.3s    ← 从 VAD 检测说话到结果返回
+```
+
 ## 已知限制
 
 1. 流式推理仅支持 vLLM backend（transformers backend 不支持）
