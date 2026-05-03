@@ -238,7 +238,6 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
 
     flush_deadline = 0.0
     final_results_pending = 0
-    utt_start_time = 0.0
 
     while not stop.is_set():
         chunk = mic.drain_one()
@@ -268,7 +267,6 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
 
         # ── IDLE → SPEAKING ──
         if prev_state == STATE_IDLE and new_state == STATE_SPEAKING:
-            utt_start_time = asyncio.get_event_loop().time()
             ctx.start_ok.clear()
             ctx.active = False
             mode = "two-pass" if args.two_pass else "streaming"
@@ -300,9 +298,10 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
         if prev_state == STATE_SPEAKING and new_state == STATE_IDLE:
             if ctx.active:
                 tui.status("Speech ended — finishing...")
+                finish_time = asyncio.get_event_loop().time()
                 await ws.send(json.dumps({"type": "finish"}))
                 await _wait_final_results(result_q, tui, timeout=8.0,
-                                          utt_start=utt_start_time)
+                                          finish_time=finish_time)
                 ctx.active = False
             tui.status("Listening...")
 
@@ -314,17 +313,17 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
     if ctx.active:
         tui.status("Stopping — finishing...")
         try:
+            finish_time = asyncio.get_event_loop().time()
             await ws.send(json.dumps({"type": "finish"}))
             await _wait_final_results(result_q, tui, timeout=4.0,
-                                      utt_start=utt_start_time)
+                                      finish_time=finish_time)
         except Exception:
             pass
 
 
 async def _wait_final_results(result_q: asyncio.Queue, tui: TUI, timeout: float,
-                              utt_start: float = 0.0):
+                              finish_time: float = 0.0):
     deadline = asyncio.get_event_loop().time() + timeout
-    got_any = False
     while asyncio.get_event_loop().time() < deadline:
         try:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -334,12 +333,7 @@ async def _wait_final_results(result_q: asyncio.Queue, tui: TUI, timeout: float,
         except asyncio.TimeoutError:
             break
         if msg.get("type") == "result" and not msg.get("is_partial", True):
-            elapsed = 0.0
-            if utt_start > 0 and not got_any:
-                elapsed = asyncio.get_event_loop().time() - utt_start
-                got_any = True
-            elif utt_start > 0:
-                elapsed = asyncio.get_event_loop().time() - utt_start
+            elapsed = asyncio.get_event_loop().time() - finish_time if finish_time > 0 else 0.0
             tui.final(msg.get("text", ""), msg.get("language", ""),
                       msg.get("pass", 1), elapsed)
             if msg.get("pass", 1) >= 2:
