@@ -272,17 +272,13 @@ async def message(id):
             if meg["mode"] == "online":
                 text_print += "{}".format(text)
                 text_print = text_print[-args.words_max_print:]
-                # os.system('clear')
-                print("\rpid" + str(id) + ": " + text_print)
+                print("\r\033[Kpid" + str(id) + ": " + text_print, end="", flush=True)
             elif meg["mode"] == "offline":
                 if timestamp !="":
                     text_print += "{} timestamp: {}".format(text, timestamp)
                 else:
                     text_print += "{}".format(text)
-
-                # text_print = text_print[-args.words_max_print:]
-                # os.system('clear')
-                print("\rpid" + str(id) + ": " + wav_name + ": " + text_print)
+                print("\r\033[Kpid" + str(id) + ": " + wav_name + ": " + text_print)
                 offline_msg_done = True
             else:
                 if meg["mode"] == "2pass-online":
@@ -293,8 +289,7 @@ async def message(id):
                     text_print = text_print_2pass_offline + "{}".format(text)
                     text_print_2pass_offline += "{}".format(text)
                 text_print = text_print[-args.words_max_print:]
-                # os.system('clear')
-                print("\rpid" + str(id) + ": " + text_print)
+                print("\r\033[Kpid" + str(id) + ": " + text_print, end="", flush=True)
                 # offline_msg_done=True
 
     except Exception as e:
