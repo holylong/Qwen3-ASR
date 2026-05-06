@@ -282,16 +282,18 @@ async def message(id):
                 offline_msg_done = True
             else:
                 if meg["mode"] == "2pass-online":
-                    text_print_2pass_online += "{}".format(text)
+                    if meg.get("is_final", False):
+                        text_print_2pass_online = text
+                    else:
+                        text_print_2pass_online += "{}".format(text)
                     text_print = text_print_2pass_offline + text_print_2pass_online
                     text_print = text_print[-args.words_max_print:]
                     print("\r\033[Kpid" + str(id) + ": " + text_print, end="", flush=True)
                 else:
-                    text_print_2pass_online = ""
-                    text_print = text_print_2pass_offline + "{}".format(text)
                     text_print_2pass_offline += "{}".format(text)
-                    text_print = text_print[-args.words_max_print:]
+                    text_print = text_print_2pass_offline[-args.words_max_print:]
                     print("\r\033[Kpid" + str(id) + ": " + text_print)
+                    text_print_2pass_online = ""
                     text_print_2pass_offline = ""
                     offline_msg_done = True
                 # offline_msg_done=True
