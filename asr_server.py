@@ -487,6 +487,7 @@ async def _send_funasr_result(ws: WebSocket, mode: str, text: str,
 
 
 @app.websocket("/ws/funasr")
+@app.websocket("/")  # FunASR client connects to root path by default
 async def websocket_funasr(ws: WebSocket):
     """FunASR-compatible WebSocket endpoint.
 
