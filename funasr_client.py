@@ -284,12 +284,16 @@ async def message(id):
                 if meg["mode"] == "2pass-online":
                     text_print_2pass_online += "{}".format(text)
                     text_print = text_print_2pass_offline + text_print_2pass_online
+                    text_print = text_print[-args.words_max_print:]
+                    print("\r\033[Kpid" + str(id) + ": " + text_print, end="", flush=True)
                 else:
                     text_print_2pass_online = ""
                     text_print = text_print_2pass_offline + "{}".format(text)
                     text_print_2pass_offline += "{}".format(text)
-                text_print = text_print[-args.words_max_print:]
-                print("\r\033[Kpid" + str(id) + ": " + text_print, end="", flush=True)
+                    text_print = text_print[-args.words_max_print:]
+                    print("\r\033[Kpid" + str(id) + ": " + text_print)
+                    text_print_2pass_offline = ""
+                    offline_msg_done = True
                 # offline_msg_done=True
 
     except Exception as e:
