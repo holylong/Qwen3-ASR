@@ -7,7 +7,7 @@ Modes:
     two-pass: Pass 1 = streaming (fast preview) + Pass 2 = offline re-transcribe
               on finish (highest accuracy).
 
-Protocol (WebSocket):
+Protocol - Qwen3-ASR native (/ws/asr):
     Client -> Server:
         {"type": "start", "mode": "streaming"|"two-pass"}   # begin session
         BINARY: raw float32 PCM 16kHz mono audio chunk
@@ -17,6 +17,21 @@ Protocol (WebSocket):
         {"type": "result", "language": "...", "text": "...",
          "is_partial": true|false, "pass": 1|2}
         {"type": "error", "message": "..."}
+
+Protocol - FunASR compatible (/ws/funasr):
+    Client -> Server:
+        JSON (first msg): {"mode": "online"|"offline"|"2pass",
+            "chunk_size": [5,10,5], "chunk_interval": 10,
+            "wav_name": "...", "wav_format": "pcm"|"wav"|"others",
+            "is_speaking": true, "hotwords": "...", "itn": true,
+            "audio_fs": 16000}
+        BINARY: raw int16 PCM or WAV bytes
+        JSON (last msg): {"is_speaking": false}
+
+    Server -> Client:
+        {"mode": "online"|"offline"|"2pass-online"|"2pass-offline",
+         "text": "...", "wav_name": "...", "is_final": true|false,
+         "timestamp": "..."}
 
 Usage:
     # From HuggingFace Hub
@@ -39,11 +54,14 @@ Install:
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import os
+import struct
 import time
 import uuid
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -138,6 +156,108 @@ async def _send_error(ws: WebSocket, message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# FunASR-compatible session
+# ---------------------------------------------------------------------------
+@dataclass
+class FunASRSession:
+    session_id: str
+    ws: WebSocket
+    funasr_mode: str         # "online" | "offline" | "2pass"
+    internal_mode: str       # "streaming" | "two-pass" | "offline"
+    wav_name: str
+    audio_fs: int
+    wav_format: str
+    itn: bool
+    hotwords: str
+    context: str
+    state: object = None     # ASRStreamingState (for online/2pass)
+    audio_accum: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    started: bool = False
+    created_at: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers for FunASR compatibility
+# ---------------------------------------------------------------------------
+def _pcm_bytes_to_float32(data: bytes, dtype_str: str = "int16") -> np.ndarray:
+    """Convert raw PCM bytes to float32 numpy array in [-1, 1]."""
+    if dtype_str == "int16":
+        pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    elif dtype_str == "float32":
+        pcm = np.frombuffer(data, dtype=np.float32)
+    else:
+        pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    return pcm.reshape(-1)
+
+
+def _parse_wav_bytes(data: bytes) -> np.ndarray:
+    """Parse WAV file bytes and return float32 mono 16kHz PCM."""
+    with wave.open(io.BytesIO(data), "rb") as wf:
+        sr = wf.getframerate()
+        n_channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        frames = wf.readframes(wf.getnframes())
+
+    if sample_width == 2:
+        pcm = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        pcm = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        pcm = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+    if n_channels > 1:
+        pcm = pcm.reshape(-1, n_channels)
+        pcm = np.mean(pcm, axis=1).astype(np.float32)
+
+    if sr != 16000:
+        try:
+            import librosa
+            pcm = librosa.resample(pcm, orig_sr=sr, target_sr=16000).astype(np.float32)
+        except ImportError:
+            ratio = 16000.0 / sr
+            n_out = int(len(pcm) * ratio)
+            indices = np.linspace(0, len(pcm) - 1, n_out).astype(int)
+            pcm = pcm[indices]
+
+    return pcm
+
+
+def _resample_pcm(pcm: np.ndarray, orig_sr: int, target_sr: int = 16000) -> np.ndarray:
+    """Resample float32 PCM to target sample rate."""
+    if orig_sr == target_sr or len(pcm) == 0:
+        return pcm
+    try:
+        import librosa
+        return librosa.resample(pcm, orig_sr=orig_sr, target_sr=target_sr).astype(np.float32)
+    except ImportError:
+        ratio = target_sr / orig_sr
+        n_out = int(len(pcm) * ratio)
+        if n_out == 0:
+            return pcm
+        indices = np.linspace(0, len(pcm) - 1, n_out).astype(int)
+        return pcm[indices]
+
+
+def _hotwords_to_context(hotwords: str) -> str:
+    """Convert FunASR hotwords JSON string to Qwen3-ASR context prompt.
+
+    FunASR hotwords format: {"word1": weight1, "word2": weight2, ...}
+    We extract the words and compose a context hint.
+    """
+    if not hotwords or not hotwords.strip():
+        return ""
+    try:
+        hw_dict = json.loads(hotwords)
+        if isinstance(hw_dict, dict):
+            words = sorted(hw_dict.keys(), key=lambda k: int(hw_dict[k]) if isinstance(hw_dict[k], (int, float)) else 0, reverse=True)
+            return "关注以下词汇: " + ", ".join(words)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Streaming (Pass 1)
 # ---------------------------------------------------------------------------
 def _streaming_step(pcm: np.ndarray, state) -> None:
@@ -167,6 +287,37 @@ def _offline_transcribe(audio: np.ndarray) -> dict:
     )
     r = results[0]
     return {"language": r.language, "text": r.text}
+
+
+def _offline_transcribe_with_timestamps(audio: np.ndarray, context: str = "") -> dict:
+    """Blocking offline transcribe with optional timestamps (runs in thread pool)."""
+    use_timestamps = asr_model.forced_aligner is not None
+    try:
+        results = asr_model.transcribe(
+            audio=(audio, 16000),
+            context=context or "",
+            language=None,
+            return_time_stamps=use_timestamps,
+        )
+    except Exception:
+        results = asr_model.transcribe(
+            audio=(audio, 16000),
+            context=context or "",
+            language=None,
+            return_time_stamps=False,
+        )
+    r = results[0]
+    result = {"language": r.language, "text": r.text, "timestamp": ""}
+    if use_timestamps and r.time_stamps is not None:
+        try:
+            ts_str = json.dumps([
+                {"text": item.text, "start": item.start_time, "end": item.end_time}
+                for item in r.time_stamps.items
+            ])
+            result["timestamp"] = ts_str
+        except Exception:
+            pass
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +453,256 @@ async def websocket_asr(ws: WebSocket):
     finally:
         if session_id:
             SESSIONS.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
+# FunASR-compatible WebSocket handler
+# ---------------------------------------------------------------------------
+FUNASR_SESSIONS: Dict[str, "FunASRSession"] = {}
+
+
+def _gc_funasr_sessions() -> None:
+    now = time.time()
+    dead = [sid for sid, s in FUNASR_SESSIONS.items() if now - s.last_seen > SESSION_TTL_SEC]
+    for sid in dead:
+        FUNASR_SESSIONS.pop(sid, None)
+
+
+async def _send_funasr_result(ws: WebSocket, mode: str, text: str,
+                               wav_name: str, is_final: bool,
+                               timestamp: str = "") -> None:
+    """Send a result in FunASR protocol format."""
+    msg = {
+        "mode": mode,
+        "text": text or "",
+        "wav_name": wav_name or "demo",
+        "is_final": is_final,
+    }
+    if timestamp:
+        msg["timestamp"] = timestamp
+    try:
+        await ws.send_text(json.dumps(msg))
+    except Exception:
+        pass
+
+
+@app.websocket("/ws/funasr")
+async def websocket_funasr(ws: WebSocket):
+    """FunASR-compatible WebSocket endpoint.
+
+    Protocol (client -> server):
+        1. First message (JSON): {"mode": "online"|"offline"|"2pass",
+           "chunk_size": [5,10,5], "chunk_interval": 10, "wav_name": "...",
+           "wav_format": "pcm"|"wav"|"others", "is_speaking": true,
+           "hotwords": "...", "itn": true, "audio_fs": 16000}
+        2. Binary audio chunks (int16 PCM or WAV bytes)
+        3. Final JSON: {"is_speaking": false}
+
+    Protocol (server -> client):
+        {"mode": "online"|"offline"|"2pass-online"|"2pass-offline",
+         "text": "...", "wav_name": "...", "is_final": true|false,
+         "timestamp": "..."}
+    """
+    await ws.accept(subprotocol="binary")
+    logger.info("FunASR WebSocket connected")
+
+    session_id = None
+    fsess: Optional[FunASRSession] = None
+
+    try:
+        while True:
+            raw = await ws.receive()
+
+            if "bytes" in raw:
+                # --- Audio chunk (binary) ---
+                data = raw["bytes"]
+                if len(data) == 0:
+                    continue
+
+                if fsess is None or not fsess.started:
+                    logger.warning("FunASR: received audio before session init, ignoring")
+                    continue
+
+                fsess.last_seen = time.time()
+
+                # Convert audio based on wav_format
+                if fsess.wav_format == "wav":
+                    pcm = _parse_wav_bytes(data)
+                elif fsess.wav_format == "pcm":
+                    pcm = _pcm_bytes_to_float32(data, "int16")
+                    pcm = _resample_pcm(pcm, fsess.audio_fs, 16000)
+                else:
+                    # "others" — try WAV first, fallback to int16 PCM
+                    try:
+                        pcm = _parse_wav_bytes(data)
+                    except Exception:
+                        pcm = _pcm_bytes_to_float32(data, "int16")
+                        pcm = _resample_pcm(pcm, fsess.audio_fs, 16000)
+
+                if pcm.size == 0:
+                    continue
+
+                # Accumulate audio for offline / two-pass
+                fsess.audio_accum = np.concatenate([fsess.audio_accum, pcm], axis=0)
+
+                if fsess.internal_mode == "offline":
+                    # Offline mode: just buffer audio, no streaming results
+                    continue
+
+                # Online / 2pass: run streaming step
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(executor, _streaming_step, pcm, fsess.state)
+                state = fsess.state
+                text = getattr(state, "text", "") or ""
+                lang = getattr(state, "language", "") or ""
+
+                if fsess.funasr_mode == "2pass":
+                    resp_mode = "2pass-online"
+                else:
+                    resp_mode = "online"
+
+                await _send_funasr_result(
+                    ws, mode=resp_mode, text=text,
+                    wav_name=fsess.wav_name, is_final=False,
+                )
+
+            elif "text" in raw:
+                # --- Control message (JSON) ---
+                text_msg = raw["text"]
+                try:
+                    msg = json.loads(text_msg)
+                except json.JSONDecodeError:
+                    continue
+
+                is_speaking = msg.get("is_speaking", None)
+
+                # ── First message: session initialization ──
+                if is_speaking is True and fsess is None:
+                    funasr_mode = msg.get("mode", "2pass")
+                    if funasr_mode not in ("online", "offline", "2pass"):
+                        funasr_mode = "2pass"
+
+                    wav_name = msg.get("wav_name", "demo")
+                    wav_format = msg.get("wav_format", "pcm")
+                    audio_fs = int(msg.get("audio_fs", 16000))
+                    itn = bool(msg.get("itn", True))
+                    hotwords = msg.get("hotwords", "")
+
+                    context = _hotwords_to_context(hotwords)
+
+                    # Map FunASR mode to internal mode
+                    if funasr_mode == "online":
+                        internal_mode = "streaming"
+                    elif funasr_mode == "offline":
+                        internal_mode = "offline"
+                    else:  # 2pass
+                        internal_mode = "two-pass"
+
+                    session_id = uuid.uuid4().hex
+
+                    # Init streaming state (for online/2pass; offline won't use it)
+                    state = None
+                    if internal_mode != "offline":
+                        state = asr_model.init_streaming_state(
+                            context=context,
+                            unfixed_chunk_num=UNFIXED_CHUNK_NUM,
+                            unfixed_token_num=UNFIXED_TOKEN_NUM,
+                            chunk_size_sec=CHUNK_SIZE_SEC,
+                        )
+
+                    fsess = FunASRSession(
+                        session_id=session_id,
+                        ws=ws,
+                        funasr_mode=funasr_mode,
+                        internal_mode=internal_mode,
+                        wav_name=wav_name,
+                        audio_fs=audio_fs,
+                        wav_format=wav_format,
+                        itn=itn,
+                        hotwords=hotwords,
+                        context=context,
+                        state=state,
+                        started=True,
+                    )
+                    FUNASR_SESSIONS[session_id] = fsess
+                    logger.info(f"FunASR session {session_id[:8]} started, "
+                                f"mode={funasr_mode}, wav={wav_name}, fs={audio_fs}")
+                    continue
+
+                # ── End of speech: is_speaking=False ──
+                if is_speaking is False and fsess is not None:
+                    fsess.last_seen = time.time()
+                    loop = asyncio.get_running_loop()
+
+                    if fsess.internal_mode == "offline":
+                        # Offline mode: transcribe all accumulated audio at once
+                        if fsess.audio_accum.size > 0:
+                            results = await loop.run_in_executor(
+                                executor, _offline_transcribe_with_timestamps,
+                                fsess.audio_accum.copy(), fsess.context,
+                            )
+                            await _send_funasr_result(
+                                ws, mode="offline",
+                                text=results["text"],
+                                wav_name=fsess.wav_name,
+                                is_final=True,
+                                timestamp=results.get("timestamp", ""),
+                            )
+                        else:
+                            await _send_funasr_result(
+                                ws, mode="offline", text="",
+                                wav_name=fsess.wav_name, is_final=True,
+                            )
+
+                    elif fsess.internal_mode == "streaming":
+                        # Online mode: finalize streaming
+                        if fsess.state is not None:
+                            await loop.run_in_executor(executor, _finish_streaming, fsess.state)
+                            state = fsess.state
+                            text = getattr(state, "text", "") or ""
+                            await _send_funasr_result(
+                                ws, mode="online", text=text,
+                                wav_name=fsess.wav_name, is_final=True,
+                            )
+
+                    elif fsess.internal_mode == "two-pass":
+                        # 2pass: finalize streaming (pass 1), then offline refine (pass 2)
+                        if fsess.state is not None:
+                            await loop.run_in_executor(executor, _finish_streaming, fsess.state)
+                            state = fsess.state
+                            text_online = getattr(state, "text", "") or ""
+                            # Send online final result
+                            await _send_funasr_result(
+                                ws, mode="2pass-online", text=text_online,
+                                wav_name=fsess.wav_name, is_final=True,
+                            )
+
+                        if fsess.audio_accum.size > 0:
+                            results = await loop.run_in_executor(
+                                executor, _offline_transcribe_with_timestamps,
+                                fsess.audio_accum.copy(), fsess.context,
+                            )
+                            await _send_funasr_result(
+                                ws, mode="2pass-offline",
+                                text=results["text"],
+                                wav_name=fsess.wav_name,
+                                is_final=True,
+                                timestamp=results.get("timestamp", ""),
+                            )
+
+                    # Cleanup
+                    FUNASR_SESSIONS.pop(session_id, None)
+                    session_id = None
+                    fsess = None
+                    logger.info("FunASR session finished")
+
+    except WebSocketDisconnect:
+        logger.info("FunASR WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"FunASR WebSocket error: {e}")
+    finally:
+        if session_id:
+            FUNASR_SESSIONS.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
