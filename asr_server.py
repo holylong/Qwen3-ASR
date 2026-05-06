@@ -558,22 +558,30 @@ async def websocket_funasr(ws: WebSocket):
                 full_text = getattr(state, "text", "") or ""
 
                 # Compute incremental text (only the new part since last send)
-                if full_text.startswith(fsess.last_sent_text):
+                # FunASR client ACCUMULATES text (text += msg), so we must
+                # only send genuinely new text to avoid duplication.
+                if full_text == fsess.last_sent_text:
+                    # No change — skip sending to avoid unnecessary screen refresh
+                    pass
+                elif full_text.startswith(fsess.last_sent_text):
+                    # Simple extension — send only the new part
                     incremental_text = full_text[len(fsess.last_sent_text):]
-                else:
-                    # Text was revised (e.g., prefix rollback), send full text
-                    incremental_text = full_text
-                fsess.last_sent_text = full_text
+                    fsess.last_sent_text = full_text
 
-                if fsess.funasr_mode == "2pass":
-                    resp_mode = "2pass-online"
-                else:
-                    resp_mode = "online"
+                    if fsess.funasr_mode == "2pass":
+                        resp_mode = "2pass-online"
+                    else:
+                        resp_mode = "online"
 
-                await _send_funasr_result(
-                    ws, mode=resp_mode, text=incremental_text,
-                    wav_name=fsess.wav_name, is_final=False,
-                )
+                    await _send_funasr_result(
+                        ws, mode=resp_mode, text=incremental_text,
+                        wav_name=fsess.wav_name, is_final=False,
+                    )
+                else:
+                    # Text was revised (prefix rollback, model re-generated).
+                    # We CANNOT send incremental because the client only appends.
+                    # Just update tracking; the final result will have correct text.
+                    fsess.last_sent_text = full_text
 
             elif "text" in raw:
                 # --- Control message (JSON) ---
