@@ -172,6 +172,7 @@ class FunASRSession:
     context: str
     state: object = None     # ASRStreamingState (for online/2pass)
     audio_accum: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    last_sent_text: str = ""  # track last sent text for incremental diff
     started: bool = False
     created_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
@@ -554,8 +555,15 @@ async def websocket_funasr(ws: WebSocket):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(executor, _streaming_step, pcm, fsess.state)
                 state = fsess.state
-                text = getattr(state, "text", "") or ""
-                lang = getattr(state, "language", "") or ""
+                full_text = getattr(state, "text", "") or ""
+
+                # Compute incremental text (only the new part since last send)
+                if full_text.startswith(fsess.last_sent_text):
+                    incremental_text = full_text[len(fsess.last_sent_text):]
+                else:
+                    # Text was revised (e.g., prefix rollback), send full text
+                    incremental_text = full_text
+                fsess.last_sent_text = full_text
 
                 if fsess.funasr_mode == "2pass":
                     resp_mode = "2pass-online"
@@ -563,7 +571,7 @@ async def websocket_funasr(ws: WebSocket):
                     resp_mode = "online"
 
                 await _send_funasr_result(
-                    ws, mode=resp_mode, text=text,
+                    ws, mode=resp_mode, text=incremental_text,
                     wav_name=fsess.wav_name, is_final=False,
                 )
 
@@ -660,9 +668,10 @@ async def websocket_funasr(ws: WebSocket):
                         if fsess.state is not None:
                             await loop.run_in_executor(executor, _finish_streaming, fsess.state)
                             state = fsess.state
-                            text = getattr(state, "text", "") or ""
+                            full_text = getattr(state, "text", "") or ""
+                            # Final result: send full text
                             await _send_funasr_result(
-                                ws, mode="online", text=text,
+                                ws, mode="online", text=full_text,
                                 wav_name=fsess.wav_name, is_final=True,
                             )
 
@@ -671,10 +680,10 @@ async def websocket_funasr(ws: WebSocket):
                         if fsess.state is not None:
                             await loop.run_in_executor(executor, _finish_streaming, fsess.state)
                             state = fsess.state
-                            text_online = getattr(state, "text", "") or ""
-                            # Send online final result
+                            full_text = getattr(state, "text", "") or ""
+                            # Send online final result (full text)
                             await _send_funasr_result(
-                                ws, mode="2pass-online", text=text_online,
+                                ws, mode="2pass-online", text=full_text,
                                 wav_name=fsess.wav_name, is_final=True,
                             )
 
