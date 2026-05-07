@@ -298,7 +298,7 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
 
             if pre_roll:
                 for c in list(pre_roll):
-                    await ws.send(c.tobytes())
+                    await ws.send((c * 32767).clip(-32768, 32767).astype(np.int16).tobytes())
                 if args.verbose:
                     tui.log(f"  pre-roll: sent {len(pre_roll)} chunks "
                             f"({len(pre_roll) * CHUNK_DURATION:.1f}s)")
@@ -306,7 +306,7 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
 
         # ── SPEAKING: send chunk ──
         if new_state == STATE_SPEAKING and ctx.active:
-            await ws.send(chunk.tobytes())
+            await ws.send((chunk * 32767).clip(-32768, 32767).astype(np.int16).tobytes())
 
         # ── SPEAKING → IDLE ──
         if prev_state == STATE_SPEAKING and new_state == STATE_IDLE:

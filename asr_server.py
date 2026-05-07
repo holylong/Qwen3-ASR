@@ -10,7 +10,7 @@ Modes:
 Protocol (WebSocket):
     Client -> Server:
         {"type": "start", "mode": "streaming"|"two-pass"}   # begin session
-        BINARY: raw float32 PCM 16kHz mono audio chunk
+         BINARY: raw int16 PCM 16kHz mono audio chunk
         {"type": "finish"}                                    # end utterance
 
     Server -> Client:
@@ -291,7 +291,7 @@ async def websocket_asr(ws: WebSocket):
                     await _send_error(ws, "No active session. Send 'start' first.")
                     continue
 
-                pcm = np.frombuffer(data, dtype=np.float32).reshape(-1)
+                pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32).reshape(-1) / 32768.0
                 if pcm.size == 0:
                     continue
 

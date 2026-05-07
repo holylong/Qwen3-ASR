@@ -25,3 +25,4 @@ env/
 models
 debug_audio
 *.wav 
+nul 
