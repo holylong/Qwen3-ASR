@@ -37,6 +37,7 @@ We release **Qwen3-ASR**, a family that includes two powerful all-in-one speech 
 - [Launch Local Web UI Demo](#launch-local-web-ui-demo)
   - [Gradio Demo](#gradio-demo)
   - [Streaming Demo](#streaming-demo)
+  - [WebSocket Server/Client](#websocket-serverclient)
 - [Deployment with vLLM](#deployment-with-vllm)
 - [Fine Tuning](#fine-tuning)
 - [Docker](#docker)
@@ -443,6 +444,50 @@ qwen-asr-demo-streaming \
 ```
 
 Then open `http://<your-ip>:8000`, or access it via port forwarding in tools like VS Code.
+
+### WebSocket Server/Client
+
+We also provide lightweight WebSocket-based server and client scripts for quick testing and integration.
+
+**Start the server:**
+
+```bash
+bash start_simple_server.sh
+```
+
+This launches the ASR server (defaults to `Qwen3-ASR-0.6B` on port 8000 with debug logging). You can also customize the command directly:
+
+```bash
+# From HuggingFace Hub
+python asr_server.py --asr-model-path Qwen/Qwen3-ASR-1.7B --port 8000
+
+# From ModelScope (auto-download)
+python asr_server.py --asr-model-path Qwen/Qwen3-ASR-1.7B --use-modelscope --port 8000
+
+# Two-pass mode (streaming + offline refinement for highest accuracy)
+python asr_server.py --asr-model-path Qwen/Qwen3-ASR-1.7B --port 8000 --two-pass
+```
+
+**Start the client:**
+
+```bash
+bash start_simple_client.sh
+```
+
+This connects the microphone client to the WebSocket server. Edit `start_simple_client.sh` to point to your server's URL. You can also run it directly:
+
+```bash
+python asr_client.py --url ws://localhost:8000/ws/asr
+python asr_client.py --url ws://localhost:8000/ws/asr --two-pass
+python asr_client.py --url ws://localhost:8000/ws/asr --verbose
+python asr_client.py --list-devices
+```
+
+Dependencies for the client:
+
+```bash
+pip install sounddevice websockets numpy
+```
 
 ## Deployment with vLLM
 
