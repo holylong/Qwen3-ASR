@@ -239,6 +239,83 @@ executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="asr_worker")
 
 方便在 `py-spy` / gdb 中排查卡死的线程。
 
+### 修复 8：客户端音频保存（调试用）
+
+**新增两个服务端参数：**
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--save-audio-dir` | `""` (关闭) | WAV 文件保存目录 |
+| `--save-audio-mode` | `session` | `session` 或 `connection` |
+
+**两种保存模式：**
+
+| | `session` | `connection` |
+|---|---|---|
+| 保存时机 | 每次 `finish`（start→finish 结束） | WebSocket 断开时（`finally` 块） |
+| 文件名 | `时间_IP_PORT_sessionID.wav` | `时间_IP_PORT_conn.wav` |
+| 音频范围 | 单个 start→finish 段落 | 整条连接的全部音频 |
+| 适用场景 | 调试某次语音识别结果 | 追踪客户端整个连接行为 |
+
+**实现细节（`asr_server.py:254-257`）：**
+
+```python
+# 连接级别累积（无条件，所有模式都可用）
+session_id = None
+conn_audio = np.zeros(0, dtype=np.float32)
+```
+
+**`asr_server.py:299-300` — 每块音频同时写入 session 级别和连接级别缓冲：**
+
+```python
+s.audio_accum = np.concatenate([s.audio_accum, pcm], axis=0)
+conn_audio = np.concatenate([conn_audio, pcm], axis=0)
+```
+
+**`asr_server.py:396-398` — session 模式在 finish 时保存：**
+
+```python
+if AUDIO_SAVE_MODE == "session":
+    _save_audio_wav(s.audio_accum, session_id, f"{client_host}:{client_port}")
+```
+
+**`asr_server.py:433-435` — connection 模式在 `finally` 时保存：**
+
+```python
+if AUDIO_SAVE_MODE == "connection":
+    _save_audio_wav(conn_audio, f"conn_{client_host}_{client_port}",
+                    f"{client_host}:{client_port}")
+```
+
+**`_save_audio_wav` helper（`asr_server.py:116-130`）** — 使用标准库 `wave` 写入，无额外依赖：
+
+```python
+def _save_audio_wav(audio: np.ndarray, session_id: str, client_addr: str) -> str:
+    if not AUDIO_SAVE_DIR or audio.size == 0:
+        return ""
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    fname = f"{ts}_{client_addr.replace(':', '_')}_{session_id[:8]}.wav"
+    path = os.path.join(AUDIO_SAVE_DIR, fname)
+    audio_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(audio_int16.tobytes())
+    logger.info(f"Audio saved: {path} ({audio.size} samples, {audio.size/16000:.1f}s)")
+    return path
+```
+
+**使用示例：**
+
+```bash
+# 调试 Android 客户端 — 每个 start/finish 段落单独文件
+python asr_server.py ... --save-audio-dir ./debug_audio --save-audio-mode session
+
+# 追踪完整连接行为 — 整个连接所有音频合并为一个文件
+python asr_server.py ... --save-audio-dir ./debug_audio --save-audio-mode connection
+```
+
 ## 诊断命令
 
 ```bash
@@ -290,6 +367,6 @@ CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION)   # = 4000
 
 | 文件 | 变更类型 | 行数变化 |
 |---|---|---|
-| `asr_server.py` | 修改 | 396 → 501 行 |
+| `asr_server.py` | 修改 | 396 → 540 行 |
 
 无新增文件。
