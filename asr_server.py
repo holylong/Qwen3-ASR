@@ -44,6 +44,7 @@ import logging
 import os
 import time
 import uuid
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -65,17 +66,31 @@ UNFIXED_CHUNK_NUM = 2
 UNFIXED_TOKEN_NUM = 5
 CHUNK_SIZE_SEC = 1.0
 SESSION_TTL_SEC = 10 * 60
+EXECUTOR_TIMEOUT = 30       # max seconds for a single model inference call
+SEND_TIMEOUT = 5            # max seconds for a WebSocket send_text
+AUDIO_SAVE_DIR = ""         # if set, save audio to WAV files (see --save-audio-dir)
+AUDIO_SAVE_MODE = "session"  # "session" = one file per start/finish; "connection" = one file per WS connect/disconnect
+
+# Serialize all concurrent model access — vLLM's synchronous LLM class is NOT
+# thread-safe and concurrent calls can deadlock or corrupt internal state.
+_model_lock = asyncio.Lock()
 
 SESSIONS: Dict[str, "Session"] = {}
 
-executor = ThreadPoolExecutor(max_workers=4)
+executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="asr_worker")
 
 app = FastAPI(title="Qwen3-ASR Streaming Server")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    pending = executor._work_queue.qsize()
+    return {
+        "status": "ok",
+        "sessions": len(SESSIONS),
+        "executor_pending": pending,
+        "executor_max_workers": executor._max_workers,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +114,23 @@ class Session:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _save_audio_wav(audio: np.ndarray, session_id: str, client_addr: str) -> str:
+    """Save accumulated audio to a WAV file. Returns the file path."""
+    if not AUDIO_SAVE_DIR or audio.size == 0:
+        return ""
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    fname = f"{ts}_{client_addr.replace(':', '_')}_{session_id[:8]}.wav"
+    path = os.path.join(AUDIO_SAVE_DIR, fname)
+    audio_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(audio_int16.tobytes())
+    logger.info(f"Audio saved: {path} ({audio.size} samples, {audio.size/16000:.1f}s)")
+    return path
+
+
 def _gc_sessions() -> None:
     now = time.time()
     dead = [sid for sid, s in SESSIONS.items() if now - s.last_seen > SESSION_TTL_SEC]
@@ -117,24 +149,66 @@ def _ensure_still_valid(session_id: str) -> Optional["Session"]:
     return s
 
 
+async def _run_in_executor(tag: str, fn, *args):
+    """Run fn in the thread pool with a timeout, timing log, and model serialization."""
+    t0 = time.time()
+    async with _model_lock:
+        t1 = time.time()
+        wait_ms = (t1 - t0) * 1000
+        if wait_ms > 100:
+            logger.info(f"[{tag}] model lock: waited {wait_ms:.0f}ms")
+        logger.debug(f"[{tag}] executor: submitting... pool_queued={executor._work_queue.qsize()}")
+        loop = asyncio.get_running_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(executor, fn, *args),
+                timeout=EXECUTOR_TIMEOUT,
+            )
+            elapsed = (time.time() - t1) * 1000
+            logger.debug(f"[{tag}] executor: done in {elapsed:.0f}ms"
+                         f" (lock_wait={wait_ms:.0f}ms)")
+            return result
+        except asyncio.TimeoutError:
+            elapsed = (time.time() - t1) * 1000
+            logger.error(f"[{tag}] executor: TIMEOUT after {EXECUTOR_TIMEOUT}s"
+                         f" (wall={elapsed:.0f}ms, lock_wait={wait_ms:.0f}ms)"
+                         f" — model inference hung!")
+            raise
+
+
 async def _send_result(ws: WebSocket, language: str, text: str, is_partial: bool, pass_num: int) -> None:
     try:
-        await ws.send_text(json.dumps({
-            "type": "result",
-            "language": language or "",
-            "text": text or "",
-            "is_partial": is_partial,
-            "pass": pass_num,
-        }))
+        await asyncio.wait_for(
+            ws.send_text(json.dumps({
+                "type": "result",
+                "language": language or "",
+                "text": text or "",
+                "is_partial": is_partial,
+                "pass": pass_num,
+            })),
+            timeout=SEND_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"_send_result: send_text timed out after {SEND_TIMEOUT}s — client not reading?")
+    except RuntimeError:
+        logger.debug("_send_result: websocket already closed, dropping result")
     except Exception:
-        pass
+        logger.debug("_send_result: send failed, dropping result")
 
 
 async def _send_error(ws: WebSocket, message: str) -> None:
     try:
-        await ws.send_text(json.dumps({"type": "error", "message": message}))
+        await asyncio.wait_for(
+            ws.send_text(json.dumps({"type": "error", "message": message})),
+            timeout=SEND_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"_send_error: send_text timed out after {SEND_TIMEOUT}s"
+                       f" — error dropped: {message}")
+    except RuntimeError:
+        logger.debug(f"_send_error: websocket already closed, dropping error: {message}")
     except Exception:
-        pass
+        logger.debug(f"_send_error: send failed, dropping error: {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +249,34 @@ def _offline_transcribe(audio: np.ndarray) -> dict:
 @app.websocket("/ws/asr")
 async def websocket_asr(ws: WebSocket):
     await ws.accept()
-    logger.info("WebSocket connected")
+    client_host = ws.client.host if ws.client else "?"
+    client_port = ws.client.port if ws.client else "?"
+    logger.info(f"WebSocket connected: {client_host}:{client_port}")
 
     session_id = None
+    conn_audio = np.zeros(0, dtype=np.float32)
 
     try:
         while True:
             raw = await ws.receive()
+            logger.debug(f"WS recv from {client_host}:{client_port}:"
+                         f" type={raw.get('type', '?')},"
+                         f" bytes={'bytes' in raw and len(raw.get('bytes', b''))},"
+                         f" text={'text' in raw and raw.get('text', '')[:100]!r}")
+
+            # Handle Starlette WebSocket internal disconnect messages
+            if raw.get("type") == "websocket.disconnect":
+                code = raw.get("code", "?")
+                reason = raw.get("reason", "")
+                logger.info(f"WebSocket disconnect: {client_host}:{client_port}"
+                            f" code={code} reason={reason!r}")
+                break
+
+            # Log unexpected message types (neither bytes nor text)
+            if "bytes" not in raw and "text" not in raw:
+                logger.warning(f"Unrecognized WS message type: {raw.get('type', '?')}"
+                               f" from {client_host}:{client_port} keys={list(raw.keys())}")
+                continue
 
             if "bytes" in raw:
                 # --- Audio chunk (binary) ---
@@ -191,6 +286,8 @@ async def websocket_asr(ws: WebSocket):
 
                 s = _ensure_still_valid(session_id)
                 if s is None:
+                    logger.warning(f"Binary data without active session"
+                                   f" from {client_host}:{client_port}")
                     await _send_error(ws, "No active session. Send 'start' first.")
                     continue
 
@@ -200,11 +297,10 @@ async def websocket_asr(ws: WebSocket):
 
                 logger.debug(f"WS audio chunk: len={pcm.size} samples, session={session_id[:8]}")
 
-                if s.mode == "two-pass":
-                    s.audio_accum = np.concatenate([s.audio_accum, pcm], axis=0)
+                s.audio_accum = np.concatenate([s.audio_accum, pcm], axis=0)
+                conn_audio = np.concatenate([conn_audio, pcm], axis=0)
 
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(executor, _streaming_step, pcm, s.state)
+                await _run_in_executor("streaming_step", _streaming_step, pcm, s.state)
                 state = s.state
                 await _send_result(
                     ws,
@@ -220,23 +316,33 @@ async def websocket_asr(ws: WebSocket):
                 try:
                     msg = json.loads(text)
                 except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON from {client_host}:{client_port}:"
+                                   f" {text[:200]!r}")
                     await _send_error(ws, "Invalid JSON")
                     continue
 
                 msg_type = msg.get("type", "")
 
                 if msg_type == "start":
+                    # Reject duplicate start if a session is already active
+                    if session_id is not None:
+                        logger.warning(f"Duplicate start rejected from {client_host}:{client_port}"
+                                       f" (existing session={session_id[:8]})")
+                        await _send_error(ws, "Session already started; finish current first")
+                        continue
+
                     mode = msg.get("mode", "streaming")
                     if mode not in ("streaming", "two-pass"):
                         await _send_error(ws, "mode must be 'streaming' or 'two-pass'")
                         continue
 
                     session_id = uuid.uuid4().hex
-                    state = asr_model.init_streaming_state(
-                        unfixed_chunk_num=UNFIXED_CHUNK_NUM,
-                        unfixed_token_num=UNFIXED_TOKEN_NUM,
-                        chunk_size_sec=CHUNK_SIZE_SEC,
-                    )
+                    async with _model_lock:
+                        state = asr_model.init_streaming_state(
+                            unfixed_chunk_num=UNFIXED_CHUNK_NUM,
+                            unfixed_token_num=UNFIXED_TOKEN_NUM,
+                            chunk_size_sec=CHUNK_SIZE_SEC,
+                        )
                     SESSIONS[session_id] = Session(
                         session_id=session_id,
                         ws=ws,
@@ -245,11 +351,16 @@ async def websocket_asr(ws: WebSocket):
                     )
                     logger.info(f"Session {session_id[:8]} started, mode={mode}")
 
-                    await ws.send_text(json.dumps({
-                        "type": "started",
-                        "session_id": session_id,
-                        "mode": mode,
-                    }))
+                    try:
+                        await ws.send_text(json.dumps({
+                            "type": "started",
+                            "session_id": session_id,
+                            "mode": mode,
+                        }))
+                    except (RuntimeError, WebSocketDisconnect) as e:
+                        logger.info(f"Client {client_host}:{client_port} disconnected"
+                                    f" during session start: {e}")
+                        break
 
                 elif msg_type == "finish":
                     s = _ensure_still_valid(session_id)
@@ -257,10 +368,8 @@ async def websocket_asr(ws: WebSocket):
                         await _send_error(ws, "No active session.")
                         continue
 
-                    loop = asyncio.get_running_loop()
-
                     # Pass 1 finalize
-                    await loop.run_in_executor(executor, _finish_streaming, s.state)
+                    await _run_in_executor("finish_streaming", _finish_streaming, s.state)
                     state = s.state
                     await _send_result(
                         ws,
@@ -273,8 +382,8 @@ async def websocket_asr(ws: WebSocket):
                     # Pass 2 (offline refine, only in two-pass mode)
                     if s.mode == "two-pass" and s.audio_accum.size > 0:
                         logger.info(f"Session {session_id[:8]}: running pass 2 (offline refine)")
-                        result = await loop.run_in_executor(
-                            executor, _offline_transcribe, s.audio_accum.copy()
+                        result = await _run_in_executor(
+                            "offline_transcribe", _offline_transcribe, s.audio_accum.copy()
                         )
                         await _send_result(
                             ws,
@@ -285,16 +394,35 @@ async def websocket_asr(ws: WebSocket):
                         )
 
                     SESSIONS.pop(session_id, None)
+                    if AUDIO_SAVE_MODE == "session":
+                        _save_audio_wav(s.audio_accum, session_id,
+                                        f"{client_host}:{client_port}")
                     session_id = None
                     logger.info(f"Session finished")
 
                 else:
+                    logger.warning(f"Unknown message type {msg_type!r}"
+                                   f" from {client_host}:{client_port}")
                     await _send_error(ws, f"Unknown message type: {msg_type}")
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.info(f"WebSocket disconnected: {client_host}:{client_port}"
+                    f" (session={session_id[:8] if session_id else 'none'})")
+    except WebSocketException:
+        logger.info(f"WebSocket exception from {client_host}:{client_port}"
+                    f" (session={session_id[:8] if session_id else 'none'})")
+    except asyncio.TimeoutError:
+        logger.error(f"Executor timeout from {client_host}:{client_port}"
+                     f" (session={session_id[:8] if session_id else 'none'})"
+                     f" — model inference blocked for >{EXECUTOR_TIMEOUT}s")
+    except asyncio.CancelledError:
+        logger.info(f"WebSocket handler cancelled: {client_host}:{client_port}")
+    except RuntimeError as e:
+        logger.error(f"WebSocket runtime error from {client_host}:{client_port}: {e}"
+                     f" (session={session_id[:8] if session_id else 'none'})")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error from {client_host}:{client_port}: {e}"
+                     f" (session={session_id[:8] if session_id else 'none'})")
         try:
             await _send_error(ws, str(e))
         except Exception:
@@ -302,6 +430,10 @@ async def websocket_asr(ws: WebSocket):
     finally:
         if session_id:
             SESSIONS.pop(session_id, None)
+            logger.info(f"Cleaned up session {session_id[:8]} on disconnect")
+        if AUDIO_SAVE_MODE == "connection":
+            _save_audio_wav(conn_audio, f"conn_{client_host}_{client_port}",
+                            f"{client_host}:{client_port}")
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +486,13 @@ def parse_args():
     p.add_argument("--unfixed-token-num", type=int, default=5)
     p.add_argument("--chunk-size-sec", type=float, default=1.0,
                    help="Chunk size in seconds")
+    p.add_argument("--save-audio-dir", default="",
+                   help="Save audio to WAV files in this directory "
+                        "(empty = disabled)")
+    p.add_argument("--save-audio-mode", default="session",
+                   choices=["session", "connection"],
+                   help="session: one WAV per start/finish; "
+                        "connection: one WAV per WS connect/disconnect")
     p.add_argument("--debug", action="store_true",
                    help="Enable debug-level logging")
     return p.parse_args()
@@ -365,10 +504,15 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    global asr_model, UNFIXED_CHUNK_NUM, UNFIXED_TOKEN_NUM, CHUNK_SIZE_SEC
+    global asr_model, UNFIXED_CHUNK_NUM, UNFIXED_TOKEN_NUM, CHUNK_SIZE_SEC, AUDIO_SAVE_DIR, AUDIO_SAVE_MODE
     UNFIXED_CHUNK_NUM = args.unfixed_chunk_num
     UNFIXED_TOKEN_NUM = args.unfixed_token_num
     CHUNK_SIZE_SEC = args.chunk_size_sec
+    AUDIO_SAVE_DIR = args.save_audio_dir
+    AUDIO_SAVE_MODE = args.save_audio_mode
+    if AUDIO_SAVE_DIR:
+        os.makedirs(AUDIO_SAVE_DIR, exist_ok=True)
+        logger.info(f"Audio save dir: {AUDIO_SAVE_DIR} (mode={AUDIO_SAVE_MODE})")
 
     model_path = _resolve_model_path(
         args.asr_model_path,
