@@ -58,7 +58,6 @@ logger = logging.getLogger("asr_server_vad")
 # ---------------------------------------------------------------------------
 asr_model = None
 vad_model = None
-vad_utils = None
 UNFIXED_CHUNK_NUM = 2
 UNFIXED_TOKEN_NUM = 5
 CHUNK_SIZE_SEC = 1.0
@@ -219,7 +218,11 @@ def _init_asr_state():
 # Silero VAD engine
 # ---------------------------------------------------------------------------
 class VADEngine:
-    """Wraps Silero VAD for streaming speech/no-speech detection.
+    """Streaming VAD using raw Silero model output.
+
+    Implements the same hysteresis state machine as VADIterator but calls
+    the model directly, avoiding dependency on silero-vad's utility class
+    (whose API may change between versions).
 
     Processes audio frame-by-frame and emits events when speech starts or
     ends. Maintains a pre-roll buffer so that the ASR model receives audio
@@ -227,20 +230,23 @@ class VADEngine:
     """
 
     def __init__(self):
-        self.vad_iterator = vad_utils[3](
-            vad_model,
-            threshold=VAD_THRESHOLD,
-            sampling_rate=VAD_SAMPLE_RATE,
-            min_silence_duration_ms=VAD_MIN_SILENCE_MS,
-            speech_pad_ms=VAD_SPEECH_PAD_MS,
+        self.model = vad_model
+        self.threshold = VAD_THRESHOLD
+        self.sampling_rate = VAD_SAMPLE_RATE
+        self.min_silence_samples = int(
+            VAD_SAMPLE_RATE * VAD_MIN_SILENCE_MS / 1000
         )
-        self.is_speaking = False
+        self.speech_pad_samples = int(
+            VAD_SAMPLE_RATE * VAD_SPEECH_PAD_MS / 1000
+        )
         self.pre_roll_chunks: deque = deque(maxlen=VAD_PRE_ROLL_CHUNKS)
         self._temp_buffer = np.zeros(0, dtype=np.float32)
+        self.reset()
 
     def reset(self):
-        self.vad_iterator.reset()
-        self.is_speaking = False
+        self._triggered = False
+        self._temp_end = 0
+        self._current_sample = 0
         self.pre_roll_chunks.clear()
         self._temp_buffer = np.zeros(0, dtype=np.float32)
 
@@ -253,18 +259,17 @@ class VADEngine:
           ("end", None)         – speech ended
           ("silence", chunk)    – non-speech (ignored by caller)
         """
-        events = []
+        events: list = []
 
-        # Insert chunk into pre-roll *before* VAD so that the chunk that
-        # triggers speech onset is included in the pre-roll sent to ASR.
+        # Store chunk in pre-roll *before* VAD so the start event includes
+        # the chunk that triggered the onset.
         self.pre_roll_chunks.append(chunk.copy())
 
-        # Concatenate any leftover samples from the previous call with the
-        # new chunk so we don't drop audio at frame boundaries.
+        # Concatenate leftover from previous call for frame alignment.
         audio = np.concatenate([self._temp_buffer, chunk])
         self._temp_buffer = np.zeros(0, dtype=np.float32)
 
-        just_started = False
+        triggered_this_call = False
 
         num_frames = len(audio) // VAD_FRAME_SIZE
         for i in range(num_frames):
@@ -272,27 +277,40 @@ class VADEngine:
             end = begin + VAD_FRAME_SIZE
             frame = audio[begin:end]
             t = torch.from_numpy(frame.copy()).float()
-            ev = self.vad_iterator(t, return_seconds=False)
 
-            if "start" in ev and not self.is_speaking:
-                self.is_speaking = True
-                just_started = True
+            with torch.no_grad():
+                speech_prob = self.model(t, self.sampling_rate).item()
+
+            self._current_sample += VAD_FRAME_SIZE
+
+            # ── Speech onset detection ──
+            if speech_prob >= self.threshold and self._temp_end != 0:
+                self._temp_end = 0
+
+            if speech_prob >= self.threshold and not self._triggered:
+                self._triggered = True
+                triggered_this_call = True
                 events.append(("start", list(self.pre_roll_chunks)))
 
-            if "end" in ev and self.is_speaking:
-                self.is_speaking = False
-                events.append(("end", None))
+            # ── Speech end detection ──
+            if speech_prob < (self.threshold - 0.15) and self._triggered:
+                if self._temp_end == 0:
+                    self._temp_end = self._current_sample
+                gap = self._current_sample - self._temp_end
+                if gap >= self.min_silence_samples:
+                    self._triggered = False
+                    self._temp_end = 0
+                    events.append(("end", None))
 
-        # Preserve fractional frame for next call
+        # Preserve incomplete frame for next call.
         leftover = len(audio) % VAD_FRAME_SIZE
         if leftover > 0:
             self._temp_buffer = audio[-leftover:].copy()
 
-        # Current chunk: only emit as "data" if speaking and not the chunk
-        # that triggered the start (that audio is already in the pre-roll).
-        if self.is_speaking and not just_started:
+        # Emit data / silence for this chunk.
+        if self._triggered and not triggered_this_call:
             events.append(("data", chunk))
-        elif not self.is_speaking:
+        elif not self._triggered:
             events.append(("silence", chunk))
 
         return events
@@ -592,7 +610,7 @@ def parse_args():
 
 
 def main():
-    global asr_model, vad_model, vad_utils
+    global asr_model, vad_model
     global UNFIXED_CHUNK_NUM, UNFIXED_TOKEN_NUM, CHUNK_SIZE_SEC
     global AUDIO_SAVE_DIR, AUDIO_SAVE_MODE
     global _model_semaphore, MAX_CONCURRENT_REQUESTS
@@ -623,7 +641,7 @@ def main():
 
     # ── Load Silero VAD ──────────────────────────────────────────
     logger.info("Loading Silero VAD model...")
-    vad_model, vad_utils = torch.hub.load(
+    vad_model, _ = torch.hub.load(
         repo_or_dir="snakers4/silero-vad",
         model="silero_vad",
         force_reload=False,
