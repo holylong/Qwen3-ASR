@@ -7,7 +7,7 @@
 # python asr_server.py --gpu-memory-utilization 0.85 --max-new-tokens 128 --chunk-size-sec 2.0
 
 python asr_server.py \
-  --asr-model-path ./models/Qwen3-ASR-1.7B \
+  --asr-model-path ./models/Qwen3-ASR-0.6B \
   --gpu-memory-utilization 0.85 \
   --max-new-tokens 128 \
   --chunk-size-sec 2.0 \
