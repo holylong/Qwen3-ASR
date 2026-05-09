@@ -71,13 +71,17 @@ SEND_TIMEOUT = 5            # max seconds for a WebSocket send_text
 AUDIO_SAVE_DIR = ""         # if set, save audio to WAV files (see --save-audio-dir)
 AUDIO_SAVE_MODE = "session"  # "session" = one file per start/finish; "connection" = one file per WS connect/disconnect
 
-# Serialize all concurrent model access — vLLM's synchronous LLM class is NOT
-# thread-safe and concurrent calls can deadlock or corrupt internal state.
-_model_lock = asyncio.Lock()
+# Concurrent model access is limited by a semaphore. vLLM's sync LLM.generate()
+# is NOT fully thread-safe when called concurrently from multiple threads, but
+# a bounded semaphore allows several request-worker threads to make progress in
+# parallel while keeping GPU memory and internal state safe on most backends.
+# Tune --max-concurrent-requests based on GPU VRAM and workload.
+MAX_CONCURRENT_REQUESTS = 4
+_model_semaphore: asyncio.Semaphore = None  # initialized in main()
 
 SESSIONS: Dict[str, "Session"] = {}
 
-executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="asr_worker")
+executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="asr_worker")
 
 app = FastAPI(title="Qwen3-ASR Streaming Server")
 
@@ -90,6 +94,7 @@ async def health():
         "sessions": len(SESSIONS),
         "executor_pending": pending,
         "executor_max_workers": executor._max_workers,
+        "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
     }
 
 
@@ -150,13 +155,13 @@ def _ensure_still_valid(session_id: str) -> Optional["Session"]:
 
 
 async def _run_in_executor(tag: str, fn, *args):
-    """Run fn in the thread pool with a timeout, timing log, and model serialization."""
+    """Run fn in the thread pool with a timeout, timing log, and concurrency limit."""
     t0 = time.time()
-    async with _model_lock:
+    async with _model_semaphore:
         t1 = time.time()
         wait_ms = (t1 - t0) * 1000
         if wait_ms > 100:
-            logger.info(f"[{tag}] model lock: waited {wait_ms:.0f}ms")
+            logger.info(f"[{tag}] model semaphore: waited {wait_ms:.0f}ms")
         logger.debug(f"[{tag}] executor: submitting... pool_queued={executor._work_queue.qsize()}")
         loop = asyncio.get_running_loop()
         try:
@@ -166,13 +171,13 @@ async def _run_in_executor(tag: str, fn, *args):
             )
             elapsed = (time.time() - t1) * 1000
             logger.debug(f"[{tag}] executor: done in {elapsed:.0f}ms"
-                         f" (lock_wait={wait_ms:.0f}ms)")
+                         f" (sem_wait={wait_ms:.0f}ms)")
             return result
         except asyncio.TimeoutError:
             elapsed = (time.time() - t1) * 1000
             logger.error(f"[{tag}] executor: TIMEOUT after {EXECUTOR_TIMEOUT}s"
-                         f" (wall={elapsed:.0f}ms, lock_wait={wait_ms:.0f}ms)"
-                         f" — model inference hung!")
+                          f" (wall={elapsed:.0f}ms, sem_wait={wait_ms:.0f}ms)"
+                          f" — model inference hung!")
             raise
 
 
@@ -337,7 +342,7 @@ async def websocket_asr(ws: WebSocket):
                         continue
 
                     session_id = uuid.uuid4().hex
-                    async with _model_lock:
+                    async with _model_semaphore:
                         state = asr_model.init_streaming_state(
                             unfixed_chunk_num=UNFIXED_CHUNK_NUM,
                             unfixed_token_num=UNFIXED_TOKEN_NUM,
@@ -493,6 +498,9 @@ def parse_args():
                    choices=["session", "connection"],
                    help="session: one WAV per start/finish; "
                         "connection: one WAV per WS connect/disconnect")
+    p.add_argument("--max-concurrent-requests", type=int, default=4,
+                   help="Max simultaneous model inference calls (higher = more concurrency,"
+                        " more GPU memory pressure)")
     p.add_argument("--debug", action="store_true",
                    help="Enable debug-level logging")
     return p.parse_args()
@@ -505,6 +513,9 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     global asr_model, UNFIXED_CHUNK_NUM, UNFIXED_TOKEN_NUM, CHUNK_SIZE_SEC, AUDIO_SAVE_DIR, AUDIO_SAVE_MODE
+    global _model_semaphore, MAX_CONCURRENT_REQUESTS
+    MAX_CONCURRENT_REQUESTS = args.max_concurrent_requests
+    _model_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     UNFIXED_CHUNK_NUM = args.unfixed_chunk_num
     UNFIXED_TOKEN_NUM = args.unfixed_token_num
     CHUNK_SIZE_SEC = args.chunk_size_sec
@@ -524,6 +535,7 @@ def main():
 
     logger.info(f"Loading model from: {model_path}")
     logger.info(f"  gpu_memory_utilization={args.gpu_memory_utilization}, max_model_len={args.max_model_len}")
+    logger.info(f"  max_concurrent_requests={args.max_concurrent_requests}, executor_workers=8")
     asr_model = Qwen3ASRModel.LLM(
         model=model_path,
         gpu_memory_utilization=args.gpu_memory_utilization,
