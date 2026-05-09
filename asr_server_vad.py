@@ -640,7 +640,12 @@ def main():
         logger.info(f"Audio save dir: {AUDIO_SAVE_DIR} (mode={AUDIO_SAVE_MODE})")
 
     # ── Load Silero VAD ──────────────────────────────────────────
-    logger.info("Loading Silero VAD model...")
+    # Cache silero-vad model files locally under ./models so it is
+    # downloaded only once (not on every server start).
+    _vad_cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    os.makedirs(_vad_cache_dir, exist_ok=True)
+    torch.hub.set_dir(_vad_cache_dir)
+    logger.info(f"Loading Silero VAD model...  (cache dir: {_vad_cache_dir})")
     vad_model, _ = torch.hub.load(
         repo_or_dir="snakers4/silero-vad",
         model="silero_vad",
