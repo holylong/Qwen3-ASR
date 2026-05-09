@@ -40,9 +40,9 @@ CHUNK_DURATION = 0.25
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION)
 
 VAD_THRESHOLD = 0.015
-SILENCE_DURATION_SEC = 1.0
-MIN_SPEECH_FRAMES = 3
-PRE_ROLL_SEC = 1.5
+SILENCE_DURATION_SEC = 0.8
+MIN_SPEECH_FRAMES = 2
+PRE_ROLL_SEC = 0.5
 
 STATE_IDLE = "idle"
 STATE_SPEAKING = "speaking"
@@ -245,7 +245,9 @@ async def recv_loop(ws, result_q: asyncio.Queue, ctx: SessionCtx, tui: TUI, stop
 # ──────────────────────────────────────────────
 async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
                      ctx: SessionCtx, tui: TUI, args, stop: threading.Event):
-    vad = VADState(threshold=args.vad_threshold)
+    vad = VADState(threshold=args.vad_threshold,
+                   silence_sec=args.silence_duration,
+                   min_speech=args.min_speech_frames)
     prev_state = STATE_IDLE
     pre_roll_max = max(1, int(args.pre_roll_sec / CHUNK_DURATION))
     pre_roll: deque = deque(maxlen=pre_roll_max)
@@ -297,12 +299,14 @@ async def send_loop(ws, mic: MicCapture, result_q: asyncio.Queue,
             tui.status(f"[{sid}] Processing...")
 
             if pre_roll:
-                for c in list(pre_roll):
-                    await ws.send((c * 32767).clip(-32768, 32767).astype(np.int16).tobytes())
-                if args.verbose:
-                    tui.log(f"  pre-roll: sent {len(pre_roll)} chunks "
-                            f"({len(pre_roll) * CHUNK_DURATION:.1f}s)")
+                pre_chunks = list(pre_roll)
                 pre_roll.clear()
+                pre_bytes = [(c * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+                             for c in pre_chunks]
+                await asyncio.gather(*[ws.send(b) for b in pre_bytes])
+                if args.verbose:
+                    tui.log(f"  pre-roll: sent {len(pre_chunks)} chunks "
+                            f"({len(pre_chunks) * CHUNK_DURATION:.1f}s)")
 
         # ── SPEAKING: send chunk ──
         if new_state == STATE_SPEAKING and ctx.active:
@@ -460,6 +464,10 @@ def parse_args():
     p.add_argument("--list-devices", action="store_true")
     p.add_argument("--vad-threshold", type=float, default=VAD_THRESHOLD)
     p.add_argument("--pre-roll-sec", type=float, default=PRE_ROLL_SEC)
+    p.add_argument("--min-speech-frames", type=int, default=MIN_SPEECH_FRAMES,
+                   help="Consecutive speech frames to trigger VAD (lower = faster)")
+    p.add_argument("--silence-duration", type=float, default=SILENCE_DURATION_SEC,
+                   help="Silence seconds before utterance end (lower = faster finish)")
     p.add_argument("--save-audio", nargs="?", const="1", default=None,
                    help="Save captured audio to WAV file (optional: path)")
     p.add_argument("--verbose", "-v", action="store_true")

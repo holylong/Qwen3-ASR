@@ -467,7 +467,7 @@ def _resolve_model_path(model_path: str, use_modelscope: bool,
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Qwen3-ASR WebSocket Server")
-    p.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-1.7B",
+    p.add_argument("--asr-model-path", default="./models/Qwen3-ASR-0.6B",
                    help="Model name or local path (ModelScope or HuggingFace)")
     p.add_argument("--use-modelscope", action="store_true",
                    help="Download model from ModelScope instead of HuggingFace Hub")
