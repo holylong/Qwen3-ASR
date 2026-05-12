@@ -185,6 +185,12 @@ async def _run_in_executor(tag: str, fn, *args):
 
 async def _send_result(ws: WebSocket, language: str, text: str, is_partial: bool,
                        pass_num: int, hotword_match=None) -> None:
+    if not text or not text.strip():
+        return
+    # Suppress hallucinated output (model echoing context / hotword list)
+    if _is_hallucinated(text):
+        logger.debug(f"_send_result: suppressed hallucinated output: {text[:80]!r}")
+        return
     payload = {
         "type": "result",
         "language": language or "",
@@ -480,9 +486,29 @@ def _load_hotwords(path: str) -> dict | None:
 
 
 def _build_asr_context(hotwords: dict | None) -> str:
-    """Build an ASR context prompt string from hotwords config."""
+    """Build a SHORT ASR context prompt string from hotwords config.
+
+    IMPORTANT: keep the context under ~30 characters. Long prompts
+    cause the model to hallucinate / echo the prompt text when
+    there is no real speech input (silence / background noise).
+    """
     if not hotwords:
         return ""
+    context = hotwords.get("context", "")
+    if context:
+        return context.strip()[:80]  # hard cap at 80 chars
+    # Auto-build a concise hint from key wake words / commands
+    wake = hotwords.get("wake_words", [])
+    cmds = hotwords.get("commands", [])
+    # Show at most 2 wake words + 4 commands as hints
+    hints = []
+    if wake:
+        hints.append("、".join(wake[:2]))
+    if cmds:
+        hints.append("、".join(cmds[:4]))
+    if hints:
+        return "控制" + "，如".join(hints)
+    return ""
     context = hotwords.get("context", "")
     if context:
         return context.strip()
@@ -499,19 +525,65 @@ def _build_asr_context(hotwords: dict | None) -> str:
 
 
 def _match_hotwords(text: str, hotwords: dict | None) -> dict | None:
-    """Check if ASR result matches any wake word or command."""
+    """Check if ASR result matches any wake word or command.
+
+    Returns a dict with matched info, or None if no match.
+    Filters out hallucinated output where the model echoes the
+    hotword list or context prompt verbatim.
+    """
     if not hotwords or not text:
         return None
+    text_clean = text.strip().replace(" ", "").replace("，", "").replace("。", "")
+    if len(text_clean) < 2:
+        return None
+
+    # ── Anti-hallucination: if the output looks like it IS the
+    #    hotword list or context, skip matching entirely ──
     wake_words = hotwords.get("wake_words", [])
     commands = hotwords.get("commands", [])
-    text_clean = text.strip().replace(" ", "").replace("，", "").replace("。", "")
+    all_hw = wake_words + commands
+    # Count how many hotwords appear in the output
+    hit_count = sum(1 for hw in all_hw if hw in text_clean)
+    # If ≥ 3 different hotwords appear, it's almost certainly the model
+    # echoing the hotword list.  Real speech rarely says 3+ commands at once.
+    if hit_count >= 3:
+        return None
+    # Also check if the output starts with the context itself
+    context = hotwords.get("context", "")
+    if context and text_clean.startswith(context.replace(" ", "")):
+        # If the output is mostly just the context, skip
+        if len(text_clean) <= len(context.replace(" ", "")) + 10:
+            return None
+
+    # Check wake words first
     for w in wake_words:
         if w in text_clean:
             return {"type": "wake_word", "word": w, "text": text_clean}
+    # Check commands
     for c in commands:
         if c in text_clean:
             return {"type": "command", "word": c, "text": text_clean}
     return None
+
+
+def _is_hallucinated(text: str) -> bool:
+    """Check if ASR output is likely a hallucinated echo of the context/hotword list.
+
+    Returns True if the text should be suppressed (not shown to user).
+    """
+    if not text or not ASR_CONTEXT:
+        return False
+    t = text.strip().replace(" ", "")
+    c = ASR_CONTEXT.strip().replace(" ", "")
+    if not c:
+        return False
+    if t == c or (len(t) >= len(c) and t.startswith(c)):
+        return True
+    if not HOTWORDS_DATA:
+        return False
+    all_hw = HOTWORDS_DATA.get("wake_words", []) + HOTWORDS_DATA.get("commands", [])
+    hit_count = sum(1 for hw in all_hw if hw in t)
+    return hit_count >= 3
 
 
 def _download_from_modelscope(model_id: str, cache_dir: str) -> str:

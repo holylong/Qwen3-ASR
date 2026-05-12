@@ -8,7 +8,7 @@
 
 python asr_server.py \
   --asr-model-path ./models/Qwen3-ASR-0.6B \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.65 \
   --max-new-tokens 128 \
   --chunk-size-sec 2.0 \
   --hotwords ./hotwords.json \
