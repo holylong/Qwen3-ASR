@@ -11,4 +11,5 @@ python asr_server.py \
   --gpu-memory-utilization 0.85 \
   --max-new-tokens 128 \
   --chunk-size-sec 2.0 \
-  --port 8000 --max-concurrent-requests 8 --debug
+  --hotwords ./hotwords.json \
+  --port 8000 --max-concurrent-requests 8 --debug --save-audio-dir ./debug_audio --save-audio-mode connection

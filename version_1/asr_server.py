@@ -62,8 +62,6 @@ logger = logging.getLogger("asr_server")
 # Global config / model
 # ---------------------------------------------------------------------------
 asr_model = None
-ASR_CONTEXT = ""              # system prompt built from hotwords config
-HOTWORDS_DATA = None          # loaded hotwords dict (wake_words + commands)
 UNFIXED_CHUNK_NUM = 2
 UNFIXED_TOKEN_NUM = 5
 CHUNK_SIZE_SEC = 1.0
@@ -183,25 +181,20 @@ async def _run_in_executor(tag: str, fn, *args):
             raise
 
 
-async def _send_result(ws: WebSocket, language: str, text: str, is_partial: bool,
-                       pass_num: int, hotword_match=None) -> None:
-    payload = {
-        "type": "result",
-        "language": language or "",
-        "text": text or "",
-        "is_partial": is_partial,
-        "pass": pass_num,
-    }
-    if hotword_match is not None:
-        payload["hotword_match"] = hotword_match
+async def _send_result(ws: WebSocket, language: str, text: str, is_partial: bool, pass_num: int) -> None:
     try:
         await asyncio.wait_for(
-            ws.send_text(json.dumps(payload)),
+            ws.send_text(json.dumps({
+                "type": "result",
+                "language": language or "",
+                "text": text or "",
+                "is_partial": is_partial,
+                "pass": pass_num,
+            })),
             timeout=SEND_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        logger.warning(f"_send_result: send_text timed out after {SEND_TIMEOUT}s"
-                       f" — client not reading?")
+        logger.warning(f"_send_result: send_text timed out after {SEND_TIMEOUT}s — client not reading?")
     except RuntimeError:
         logger.debug("_send_result: websocket already closed, dropping result")
     except Exception:
@@ -248,7 +241,7 @@ def _offline_transcribe(audio: np.ndarray) -> dict:
     """Blocking offline transcribe of accumulated audio (runs in thread pool)."""
     results = asr_model.transcribe(
         audio=(audio, 16000),
-        context=ASR_CONTEXT,
+        context="",
         language=None,
     )
     r = results[0]
@@ -351,7 +344,6 @@ async def websocket_asr(ws: WebSocket):
                     session_id = uuid.uuid4().hex
                     async with _model_semaphore:
                         state = asr_model.init_streaming_state(
-                            context=ASR_CONTEXT,
                             unfixed_chunk_num=UNFIXED_CHUNK_NUM,
                             unfixed_token_num=UNFIXED_TOKEN_NUM,
                             chunk_size_sec=CHUNK_SIZE_SEC,
@@ -384,18 +376,13 @@ async def websocket_asr(ws: WebSocket):
                     # Pass 1 finalize
                     await _run_in_executor("finish_streaming", _finish_streaming, s.state)
                     state = s.state
-                    text_p1 = getattr(state, "text", "") or ""
-                    hw = _match_hotwords(text_p1, HOTWORDS_DATA)
                     await _send_result(
                         ws,
                         language=getattr(state, "language", "") or "",
-                        text=text_p1,
+                        text=getattr(state, "text", "") or "",
                         is_partial=False,
                         pass_num=1,
-                        hotword_match=hw,
                     )
-                    logger.info(f"Session {session_id[:8]} pass 1 final: {text_p1[:120]}"
-                                f"{'  [HOTWORD=' + hw['word'] + ']' if hw else ''}")
 
                     # Pass 2 (offline refine, only in two-pass mode)
                     if s.mode == "two-pass" and s.audio_accum.size > 0:
@@ -403,17 +390,13 @@ async def websocket_asr(ws: WebSocket):
                         result = await _run_in_executor(
                             "offline_transcribe", _offline_transcribe, s.audio_accum.copy()
                         )
-                        hw2 = _match_hotwords(result["text"], HOTWORDS_DATA)
                         await _send_result(
                             ws,
                             language=result["language"],
                             text=result["text"],
                             is_partial=False,
                             pass_num=2,
-                            hotword_match=hw2,
                         )
-                        logger.info(f"Session {session_id[:8]} pass 2 final: {result['text'][:120]}"
-                                    f"{'  [HOTWORD=' + hw2['word'] + ']' if hw2 else ''}")
 
                     SESSIONS.pop(session_id, None)
                     if AUDIO_SAVE_MODE == "session":
@@ -461,59 +444,6 @@ async def websocket_asr(ws: WebSocket):
 # ---------------------------------------------------------------------------
 # Model download (ModelScope)
 # ---------------------------------------------------------------------------
-def _load_hotwords(path: str) -> dict | None:
-    """Load hotwords JSON config. Returns dict or None on failure."""
-    if not path or not os.path.isfile(path):
-        if path:
-            logger.warning(f"Hotwords file not found: {path}")
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"Failed to load hotwords config: {e}")
-        return None
-    if not isinstance(data, dict):
-        logger.warning("Hotwords config is not a JSON object — ignored")
-        return None
-    return data
-
-
-def _build_asr_context(hotwords: dict | None) -> str:
-    """Build an ASR context prompt string from hotwords config."""
-    if not hotwords:
-        return ""
-    context = hotwords.get("context", "")
-    if context:
-        return context.strip()
-    wake = hotwords.get("wake_words", [])
-    cmds = hotwords.get("commands", [])
-    parts = []
-    if wake:
-        parts.append("唤醒词：" + "、".join(wake))
-    if cmds:
-        parts.append("可执行指令：" + "、".join(cmds))
-    if parts:
-        return "你是一个智能语音控制系统。请识别以下语音。" + "。".join(parts) + "。"
-    return ""
-
-
-def _match_hotwords(text: str, hotwords: dict | None) -> dict | None:
-    """Check if ASR result matches any wake word or command."""
-    if not hotwords or not text:
-        return None
-    wake_words = hotwords.get("wake_words", [])
-    commands = hotwords.get("commands", [])
-    text_clean = text.strip().replace(" ", "").replace("，", "").replace("。", "")
-    for w in wake_words:
-        if w in text_clean:
-            return {"type": "wake_word", "word": w, "text": text_clean}
-    for c in commands:
-        if c in text_clean:
-            return {"type": "command", "word": c, "text": text_clean}
-    return None
-
-
 def _download_from_modelscope(model_id: str, cache_dir: str) -> str:
     logger.info(f"Downloading model from ModelScope: {model_id}")
     try:
@@ -571,10 +501,6 @@ def parse_args():
     p.add_argument("--max-concurrent-requests", type=int, default=4,
                    help="Max simultaneous model inference calls (higher = more concurrency,"
                         " more GPU memory pressure)")
-    p.add_argument("--hotwords", default="",
-                   help="Path to hotwords JSON config file "
-                        "(e.g. hotwords.json). Loads wake words + commands "
-                        "and passes them as context prompt to the ASR model.")
     p.add_argument("--debug", action="store_true",
                    help="Enable debug-level logging")
     return p.parse_args()
@@ -586,7 +512,7 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    global asr_model, ASR_CONTEXT, HOTWORDS_DATA, UNFIXED_CHUNK_NUM, UNFIXED_TOKEN_NUM, CHUNK_SIZE_SEC, AUDIO_SAVE_DIR, AUDIO_SAVE_MODE
+    global asr_model, UNFIXED_CHUNK_NUM, UNFIXED_TOKEN_NUM, CHUNK_SIZE_SEC, AUDIO_SAVE_DIR, AUDIO_SAVE_MODE
     global _model_semaphore, MAX_CONCURRENT_REQUESTS
     MAX_CONCURRENT_REQUESTS = args.max_concurrent_requests
     _model_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -598,18 +524,6 @@ def main():
     if AUDIO_SAVE_DIR:
         os.makedirs(AUDIO_SAVE_DIR, exist_ok=True)
         logger.info(f"Audio save dir: {AUDIO_SAVE_DIR} (mode={AUDIO_SAVE_MODE})")
-
-    # ── Load hotwords config ─────────────────────────────────────
-    HOTWORDS_DATA = _load_hotwords(args.hotwords)
-    ASR_CONTEXT = _build_asr_context(HOTWORDS_DATA)
-    if HOTWORDS_DATA:
-        wake_n = len(HOTWORDS_DATA.get("wake_words", []))
-        cmd_n = len(HOTWORDS_DATA.get("commands", []))
-        logger.info(f"Hotwords loaded: {wake_n} wake words, {cmd_n} commands"
-                    f" from {args.hotwords}")
-        logger.info(f"ASR context prompt: {ASR_CONTEXT[:120]}...")
-    elif args.hotwords:
-        logger.warning(f"Hotwords file specified but could not be loaded: {args.hotwords}")
 
     model_path = _resolve_model_path(
         args.asr_model_path,

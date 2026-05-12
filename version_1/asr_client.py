@@ -141,14 +141,6 @@ class TUI:
         sys.stdout.write(f"\r  \033[90m… {m}\033[0m")
         sys.stdout.flush()
 
-    def hotword(self, hw_type, word):
-        """Display hotword / wake-word match."""
-        self._c()
-        icon = "\033[36m⚑\033[0m" if hw_type == "wake_word" else "\033[35m⌘\033[0m"
-        label = "WAKE" if hw_type == "wake_word" else "CMD"
-        sys.stdout.write(f"\r  {icon} [{label}] {word}\n")
-        sys.stdout.flush()
-
 
 # ──────────────────────────────────────────────
 # Shared state between send & receive tasks
@@ -240,9 +232,6 @@ async def recv_loop(ws, result_q: asyncio.Queue, ctx: SessionCtx, tui: TUI, stop
             if is_partial:
                 tui.partial(msg.get("text", ""), msg.get("language", ""))
             # final results are displayed by send_loop with timing
-            hw = msg.get("hotword_match")
-            if hw and isinstance(hw, dict) and not is_partial:
-                tui.hotword(hw.get("type", ""), hw.get("word", ""))
         elif t == "error":
             tui.err(msg.get("message", "Server error"))
         elif tui.verbose:
@@ -365,9 +354,6 @@ async def _wait_final_results(result_q: asyncio.Queue, tui: TUI, timeout: float,
             elapsed = asyncio.get_event_loop().time() - finish_time if finish_time > 0 else 0.0
             tui.final(msg.get("text", ""), msg.get("language", ""),
                       msg.get("pass", 1), elapsed)
-            hw = msg.get("hotword_match")
-            if hw and isinstance(hw, dict):
-                tui.hotword(hw.get("type", ""), hw.get("word", ""))
             if msg.get("pass", 1) >= 2:
                 break
         elif msg.get("type") == "error":
