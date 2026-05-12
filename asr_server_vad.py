@@ -532,20 +532,21 @@ async def _finish_asr_session(session: Session, ws: WebSocket, utt_num: int):
         await _run_in_executor("finish_streaming", _finish_streaming, session.state)
         st = session.state
         text_p1 = getattr(st, "text", "") or ""
-        hw = _match_hotwords(text_p1, HOTWORDS_DATA)
+        # In two-pass mode, only send hotword_match with the higher-quality
+        # pass-2 result to avoid duplicate match lines.
+        is_two_pass = (session.mode == "two-pass")
         await _send_result(
             ws,
             getattr(st, "language", "") or "",
             text_p1,
             is_partial=False,
             pass_num=1,
-            hotword_match=hw,
+            hotword_match=_match_hotwords(text_p1, HOTWORDS_DATA) if not is_two_pass else None,
         )
-        logger.info(f"  Pass 1 final [{session.session_id[:8]}]: {text_p1[:120]}"
-                    f"{'  [HOTWORD=' + hw['word'] + ']' if hw else ''}")
+        logger.info(f"  Pass 1 final [{session.session_id[:8]}]: {text_p1[:120]}")
 
         # Pass 2 – offline refine (two-pass mode only)
-        if session.mode == "two-pass" and session.audio_accum.size > 0:
+        if is_two_pass and session.audio_accum.size > 0:
             logger.info(f"  Running pass 2 (offline refine)")
             result = await _run_in_executor(
                 "offline_transcribe",

@@ -105,6 +105,7 @@ def _trim(s, w=0):
 class TUI:
     def __init__(self, verbose=False):
         self.verbose = verbose
+        self._last_hw = None  # (type, word) — deduplicate consecutive hotwords
 
     def _c(self):
         sys.stdout.write("\r\033[K")
@@ -142,7 +143,11 @@ class TUI:
         sys.stdout.flush()
 
     def hotword(self, hw_type, word):
-        """Display hotword / wake-word match."""
+        """Display hotword / wake-word match (deduplicated)."""
+        key = (hw_type, word)
+        if key == self._last_hw:
+            return
+        self._last_hw = key
         self._c()
         icon = "\033[36m⚑\033[0m" if hw_type == "wake_word" else "\033[35m⌘\033[0m"
         label = "WAKE" if hw_type == "wake_word" else "CMD"
